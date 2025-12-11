@@ -5,7 +5,6 @@ from fastapi import FastAPI
 from .cart import router as cart_router
 from .order import router as order_router
 from .refund import router as refund_router
-from .address import router as address_router
 from .merchant import router as merchant_router
 
 def register_routes(app: FastAPI):

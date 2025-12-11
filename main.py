@@ -21,7 +21,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 # 导入路由注册函数（使用新的目录结构）
 from api.finance.routes import register_finance_routes
 from api.user.routes import register_routes as register_user_routes
-from api.order import register_routes as register_order_routes
 from api.product.routes import register_routes as register_product_routes
 
 
@@ -129,7 +128,6 @@ setup_static_files(app)
 # 注册所有模块的路由
 register_finance_routes(app)
 register_user_routes(app)
-register_order_routes(app)
 register_product_routes(app)
 
 
