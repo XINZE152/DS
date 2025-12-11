@@ -33,17 +33,23 @@ class SetLevelReq(BaseModel):
     reason: str = "后台手动调整"
 
 
+
 class AddressReq(BaseModel):
-    """地址请求"""
-    mobile: str
-    name: str
-    phone: str
+    mobile: str                # 用来查 user_id
+    label: str
+    name: str                  # 即 consignee_name
+    phone: str                 # 即 consignee_phone
     province: str
     city: str
     district: str
     detail: str
+    lng: Optional[float] = None
+    lat: Optional[float] = None
     is_default: bool = False
     addr_type: str = "shipping"
+
+    class Config:
+        allow_population_by_field_name = True   # 同时支持 name / consignee_name
 
 
 class PointsReq(BaseModel):

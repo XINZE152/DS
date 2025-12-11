@@ -191,10 +191,6 @@ def admin_reset_password(body: AdminResetPwdReq):
 
             new_hash = hash_pwd(body.new_password)
             cur.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, u["id"]))
-            cur.execute(
-                "INSERT INTO audit_log(user_id, op_type, old_val, new_val, reason) VALUES (%s,'RESET_PWD',0,1,'后台重置')",
-                (u["id"],)
-            )
             conn.commit()
     return {"msg": "密码已重置"}
 
@@ -373,8 +369,16 @@ def address_add(body: AddressReq):
             if not u:
                 _err("用户不存在")
             addr_id = AddressService.add_address(
-                u["id"], body.name, body.phone, body.province, body.city,
-                body.district, body.detail, body.is_default, body.addr_type
+                u["id"],
+                body.name,  # consignee_name
+                body.phone,  # consignee_phone
+                body.province,
+                body.city,
+                body.district,
+                body.detail,
+                body.label,  # ❗新增这一行
+                body.is_default,
+                body.addr_type
             )
             return {"addr_id": addr_id}
 

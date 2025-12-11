@@ -51,10 +51,11 @@ class AddressManager:
                 return cur.rowcount > 0
 
 # ---------------- 路由 ----------------
-class AddressAdd(BaseModel):
+class AddressReq(BaseModel):
+    mobile: str                # 用来查 user_id
     label: str
-    consignee_name: str
-    consignee_phone: str
+    name: str                  # 即 consignee_name
+    phone: str                 # 即 consignee_phone
     province: str
     city: str
     district: str
@@ -62,14 +63,23 @@ class AddressAdd(BaseModel):
     lng: Optional[float] = None
     lat: Optional[float] = None
     is_default: bool = False
+    addr_type: str = "shipping"
 
 @router.post("/add", summary="新增收货地址")
-def add_address(body: AddressAdd, user_id: int):
-    addr_id = AddressManager.add(user_id, body.label, body.consignee_name,
-                                 body.consignee_phone, body.province, body.city,
-                                 body.district, body.detail, body.lng, body.lat,
-                                 body.is_default)
-    return {"id": addr_id}
+def address_add(body: AddressReq):
+    addr_id = AddressService.add_address(
+        user_id=body.mobile,          # 这里你原来用 mobile 查 user，保持即可
+        consignee_name=body.name,     # 实际是 body.name → consignee_name
+        consignee_phone=body.phone,
+        province=body.province,
+        city=body.city,
+        district=body.district,
+        detail=body.detail,
+        label=body.label,
+        is_default=body.is_default,
+        addr_type=body.addr_type
+    )
+    return {"addr_id": addr_id}
 
 @router.get("/{user_id}", summary="查询用户地址列表")
 def list_addresses(user_id: int):
