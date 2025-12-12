@@ -81,6 +81,8 @@ class DatabaseManager:
                     withdrawable_balance BIGINT NOT NULL DEFAULT 0 COMMENT '可提现余额',
                     avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT '头像路径',
                     is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT '判断是不是商家',
+                    bank_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '银行名称',
+                    bank_account VARCHAR(255) NOT NULL DEFAULT '' COMMENT '银行账号',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),
@@ -387,6 +389,8 @@ class DatabaseManager:
                 'is_merchant': 'is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'判断是不是商家\'',
                 'status': 'status TINYINT NOT NULL DEFAULT 1',
                 'avatar_path': 'avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT \'头像路径\'',
+                'bank_name': 'bank_name VARCHAR(255) NOT NULL DEFAULT \'\' COMMENT \'银行名称\'',
+                'bank_account': 'bank_account VARCHAR(255) NOT NULL DEFAULT \'\' COMMENT \'银行账号\'',
             }
         }
         
