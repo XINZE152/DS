@@ -91,7 +91,7 @@ class FinanceService:
     # ==================== 关键修改1：商品查询使用 LEFT JOIN product_skus ====================
     def settle_order(self, order_no: str, user_id: int, product_id: int, quantity: int = 1,
                      points_to_use: Decimal = Decimal('0')) -> int:
-        logger.info(f"\n🛒 订单结算开始: {order_no}")
+        logger.debug(f"订单结算开始: {order_no}")
         try:
             with self.session.begin():
                 # 关键修改：从 product_skus 表获取价格，兼容旧数据
@@ -150,7 +150,7 @@ class FinanceService:
                     self._apply_points_discount(user_id, user, points_to_use, original_amount)
                     points_discount = points_to_use * POINTS_DISCOUNT_RATE
                     final_amount = original_amount - points_discount
-                    logger.info(f"💳 积分抵扣: {points_to_use:.4f}分 = ¥{points_discount:.4f}")
+                    logger.debug(f"积分抵扣: {points_to_use:.4f}分 = ¥{points_discount:.4f}")
 
                 order_id = self._create_order(
                     order_no, user_id, merchant_id, product_id,
@@ -162,7 +162,7 @@ class FinanceService:
                 else:
                     self._process_normal_order(order_id, user_id, merchant_id, final_amount, user.member_level)
 
-            logger.info(f"✅ 订单结算成功: ID={order_id}")
+            logger.debug(f"订单结算成功: ID={order_id}")
             return order_id
         except Exception as e:
             logger.error(f"订单结算失败: {e}")
@@ -239,7 +239,7 @@ class FinanceService:
                                 type='member',
                                 reason='购买会员商品获得积分',
                                 related_order=order_id)
-        logger.info(f"🎉 用户升级: {old_level}星 → {new_level}星, 获得积分: {points_earned:.4f}")
+        logger.debug(f"用户升级: {old_level}星 → {new_level}星, 获得积分: {points_earned:.4f}")
 
         self._create_pending_rewards(order_id, user_id, old_level, new_level)
 
@@ -258,7 +258,7 @@ class FinanceService:
             # 统一通过 helper 更新各类池子与记录流水
             self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}")
             if purpose == AllocationKey.PUBLIC_WELFARE:
-                logger.info(f"🎗️ 公益基金获得: ¥{alloc_amount}")
+                logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
     def _create_pending_rewards(self, order_id: int, buyer_id: int, old_level: int, new_level: int) -> None:
         if old_level == 0:
@@ -278,10 +278,10 @@ class FinanceService:
                         "order_id": order_id
                     }
                 )
-                logger.info(f"🎁 推荐奖励待审核: 用户{referrer.referrer_id} ¥{reward_amount}")
+                logger.debug(f"推荐奖励待审核: 用户{referrer.referrer_id} ¥{reward_amount}")
 
         if old_level == 0 and new_level == 1:
-            logger.info("0星升级1星，不产生团队奖励")
+            logger.debug("0星升级1星，不产生团队奖励")
             return
 
         target_layer = new_level
@@ -325,7 +325,7 @@ class FinanceService:
                         "layer": target_layer
                     }
                 )
-                logger.info(f"🎁 团队奖励待审核: 用户{target_referrer} L{target_layer} ¥{reward_amount}")
+                logger.debug(f"团队奖励待审核: 用户{target_referrer} L{target_layer} ¥{reward_amount}")
 
     def _process_normal_order(self, order_id: int, user_id: int, merchant_id: int,
                               final_amount: Decimal, member_level: int) -> None:
@@ -338,12 +338,12 @@ class FinanceService:
             #                           change_amount=merchant_amount,
             #                           flow_type='income',
             #                           remark=f"普通商品收益 - 订单#{order_id}")
-            logger.info(f"💰 商家{merchant_id}到账: ¥{merchant_amount}")
+            logger.debug(f"商家{merchant_id}到账: ¥{merchant_amount}")
         else:
             platform_amount = final_amount * Decimal('0.80')
             # 平台自营商品收入进入平台池子
             self._add_pool_balance('platform_revenue_pool', platform_amount, f"平台自营商品收入 - 订单#{order_id}")
-            logger.info(f"💰 平台自营商品收入: ¥{platform_amount}")
+            logger.debug(f"平台自营商品收入: ¥{platform_amount}")
 
             for purpose, percent in ALLOCATIONS.items():
                 alloc_amount = final_amount * percent
@@ -351,7 +351,7 @@ class FinanceService:
                 self._add_pool_balance(purpose.value, alloc_amount, f"订单#{order_id} 分配到{purpose.value}",
                                        related_user=user_id)
                 if purpose == AllocationKey.PUBLIC_WELFARE:
-                    logger.info(f"🎗️ 公益基金获得: ¥{alloc_amount}")
+                    logger.debug(f"公益基金获得: ¥{alloc_amount}")
 
         if member_level >= 1:
             points_earned = final_amount
@@ -363,7 +363,7 @@ class FinanceService:
                                     type='member',
                                     reason='购买获得积分',
                                     related_order=order_id)
-            logger.info(f"💎 用户获得积分: {points_earned:.4f}")
+            logger.debug(f"用户获得积分: {points_earned:.4f}")
 
         if merchant_id != PLATFORM_MERCHANT_ID:
             merchant_points = final_amount * Decimal('0.20')
@@ -375,7 +375,7 @@ class FinanceService:
                                         type='merchant',
                                         reason='销售获得积分',
                                         related_order=order_id)
-                logger.info(f"💎 商家获得积分: {merchant_points:.4f}")
+                logger.debug(f"商家获得积分: {merchant_points:.4f}")
 
     def audit_and_distribute_rewards(self, reward_ids: List[int], approve: bool, auditor: str = 'admin') -> bool:
         try:
@@ -425,13 +425,13 @@ class FinanceService:
                         flow_type='coupon',
                         remark=f"{reward_desc}奖励发放优惠券#{coupon_id} ¥{reward.amount:.2f}"
                     )
-                    logger.info(f"✅ 奖励{reward.id}已批准，发放优惠券{coupon_id}")
+                    logger.debug(f"奖励{reward.id}已批准，发放优惠券{coupon_id}")
             else:
                 self.session.execute(
                     f"UPDATE pending_rewards SET status = 'rejected' WHERE id IN ({placeholders})",
                     params
                 )
-                logger.info(f"❌ 已拒绝 {len(reward_ids)} 条奖励")
+                logger.debug(f"已拒绝 {len(reward_ids)} 条奖励")
 
             self.session.commit()
             return True
@@ -513,7 +513,7 @@ class FinanceService:
                 amount = Decimal(str(order.total_amount))
                 merchant_id = order.merchant_id
 
-                logger.info(f"\n💸 订单退款: {order_no} (会员商品: {is_member})")
+                logger.debug(f"订单退款: {order_no} (会员商品: {is_member})")
 
                 if is_member:
                     result = self.session.execute(
@@ -587,7 +587,7 @@ class FinanceService:
                     {"order_id": order.id}
                 )
 
-            logger.info(f"✅ 订单退款成功: {order_no}")
+            logger.debug(f"订单退款成功: {order_no}")
             return True
 
         except Exception as e:
@@ -595,7 +595,7 @@ class FinanceService:
             return False
 
     def distribute_weekly_subsidy(self) -> bool:
-        logger.info("\n📊 周补贴发放开始（优惠券形式）")
+        logger.info("周补贴发放开始（优惠券形式）")
 
         pool_balance = self.get_account_balance('subsidy_pool')
         if pool_balance <= 0:
@@ -748,12 +748,12 @@ class FinanceService:
                     )
 
                     total_distributed += subsidy_amount
-                    logger.info(f"商家{merchant.id}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
+                    logger.debug(f"商家{merchant.id}: 优惠券¥{subsidy_amount:.4f}, 扣积分{deduct_points:.4f}")
 
-                logger.info(f"ℹ️ 公司积分{company_points}未扣除，未发放优惠券")
+                logger.debug(f"公司积分{company_points}未扣除，未发放优惠券")
 
             logger.info(
-                f"✅ 周补贴完成: 发放¥{total_distributed:.4f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
+                f"周补贴完成: 发放¥{total_distributed:.4f}优惠券（补贴池余额不变: ¥{pool_balance}，公司积分不扣除）")
             return True
         except Exception as e:
             logger.error(f"❌ 周补贴发放失败: {e}")
@@ -811,7 +811,7 @@ class FinanceService:
             )
 
             self.session.commit()
-            logger.info(f"💸 提现申请 #{withdrawal_id}: ¥{amount_decimal}（税¥{tax_amount:.2f}，实到¥{actual_amount:.2f}）")
+            logger.debug(f"提现申请 #{withdrawal_id}: ¥{amount_decimal}（税¥{tax_amount:.2f}，实到¥{actual_amount:.2f}）")
             return withdrawal_id
 
         except Exception as e:
@@ -870,7 +870,7 @@ class FinanceService:
                     flow_type='income',
                     remark=f"提现到账 #{withdrawal_id}"
                 )
-                logger.info(f"✅ 提现审核通过 #{withdrawal_id}，到账¥{withdraw.actual_amount:.2f}")
+                logger.debug(f"提现审核通过 #{withdrawal_id}，到账¥{withdraw.actual_amount:.2f}")
             else:
                 balance_field = 'promotion_balance' if withdraw.withdrawal_type == 'user' else 'merchant_balance'
                 self.session.execute(
@@ -885,7 +885,7 @@ class FinanceService:
                     flow_type='income',
                     remark=f"提现拒绝退回 #{withdrawal_id}"
                 )
-                logger.info(f"❌ 提现审核拒绝 #{withdrawal_id}")
+                logger.debug(f"提现审核拒绝 #{withdrawal_id}")
 
             self.session.commit()
             return True
@@ -1109,7 +1109,7 @@ class FinanceService:
             )
 
             self.session.commit()
-            logger.info(f"✅ 用户{user_id}的推荐人设置为{referrer_id}（{referrer.member_level}星）")
+            logger.debug(f"用户{user_id}的推荐人设置为{referrer_id}（{referrer.member_level}星）")
             return True
 
         except Exception as e:
@@ -1159,7 +1159,7 @@ class FinanceService:
 
     def check_director_promotion(self) -> bool:
         try:
-            logger.info("\n👑 荣誉董事晋升审核")
+            logger.debug("荣誉董事晋升审核")
 
             result = self.session.execute("SELECT id FROM users WHERE member_level = 6")
             six_star_users = result.fetchall()
@@ -1198,10 +1198,10 @@ class FinanceService:
                     )
                     if result.rowcount > 0:
                         promoted_count += 1
-                        logger.info(f"🎉 用户{user_id}晋升为荣誉董事！（直接:{direct_count}, 团队:{total_count}）")
+                        logger.info(f"用户{user_id}晋升为荣誉董事！（直接:{direct_count}, 团队:{total_count}）")
 
             self.session.commit()
-            logger.info(f"👑 荣誉董事审核完成: 晋升{promoted_count}人")
+            logger.info(f"荣誉董事审核完成: 晋升{promoted_count}人")
             return True
 
         except Exception as e:

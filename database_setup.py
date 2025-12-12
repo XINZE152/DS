@@ -26,7 +26,7 @@ class DatabaseManager:
             )
             conn.commit()
             conn.close()
-            logger.info(f"✅ 数据库 `{database}` 已就绪")
+            logger.debug(f"数据库 `{database}` 已就绪")
         except Exception as e:
             logger.error(f"❌ 数据库初始化失败: {e}")
             raise
@@ -58,7 +58,7 @@ class DatabaseManager:
             logger.debug(f"表 {table_name} 可能不存在，将在创建表时处理: {e}")
 
     def init_all_tables(self, cursor):
-        logger.info("\n=== 初始化数据库表结构 ===")
+        logger.info("初始化数据库表结构")
 
         tables = {
             'users': """
@@ -392,7 +392,7 @@ class DatabaseManager:
         
         for table_name, sql in tables.items():
             cursor.execute(sql)
-            logger.info(f"✅ 表 `{table_name}` 已创建/确认")
+            logger.debug(f"表 `{table_name}` 已创建/确认")
             
             # 检查并更新表结构（添加缺失的字段）
             if table_name in required_columns:
@@ -409,7 +409,7 @@ class DatabaseManager:
         self._add_product_skus_foreign_keys(cursor)
 
         self._init_finance_accounts(cursor)
-        logger.info("✅ 所有表结构初始化完成")
+        logger.info("数据库表结构初始化完成")
 
     def _add_cart_foreign_keys(self, cursor):
         """为 cart 表添加外键约束（如果不存在）"""
@@ -443,7 +443,7 @@ class DatabaseManager:
                     ADD CONSTRAINT cart_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ cart 表外键约束 cart_ibfk_1 已添加")
+                logger.debug("cart 表外键约束 cart_ibfk_1 已添加")
             
             if 'cart_ibfk_2' not in existing_fks:
                 cursor.execute("""
@@ -451,7 +451,7 @@ class DatabaseManager:
                     ADD CONSTRAINT cart_ibfk_2 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ cart 表外键约束 cart_ibfk_2 已添加")
+                logger.debug("cart 表外键约束 cart_ibfk_2 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ cart 表外键约束添加失败（已忽略）: {e}")
@@ -500,7 +500,7 @@ class DatabaseManager:
                     ADD CONSTRAINT refunds_ibfk_1 
                     FOREIGN KEY (order_number) REFERENCES orders(order_number) ON DELETE CASCADE
                 """)
-                logger.info("✅ refunds 表外键约束 refunds_ibfk_1 已添加")
+                logger.debug("refunds 表外键约束 refunds_ibfk_1 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ refunds 表外键约束添加失败（已忽略）: {e}")
@@ -523,7 +523,7 @@ class DatabaseManager:
                     ADD CONSTRAINT orders_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ orders 表外键约束 orders_ibfk_1 已添加")
+                logger.debug("orders 表外键约束 orders_ibfk_1 已添加")
         except Exception as e:
             logger.warning(f"⚠️ orders 表外键约束添加失败（可忽略）: {e}")
 
@@ -545,7 +545,7 @@ class DatabaseManager:
                     ADD CONSTRAINT order_items_ibfk_1 
                     FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ order_items 表外键约束 order_items_ibfk_1 已添加")
+                logger.debug("order_items 表外键约束 order_items_ibfk_1 已添加")
             
             if 'order_items_ibfk_2' not in existing_fks:
                 cursor.execute("""
@@ -553,7 +553,7 @@ class DatabaseManager:
                     ADD CONSTRAINT order_items_ibfk_2 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ order_items 表外键约束 order_items_ibfk_2 已添加")
+                logger.debug("order_items 表外键约束 order_items_ibfk_2 已添加")
         except Exception as e:
             logger.warning(f"⚠️ order_items 表外键约束添加失败（可忽略）: {e}")
 
@@ -588,7 +588,7 @@ class DatabaseManager:
                     ADD CONSTRAINT addresses_ibfk_1 
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ addresses 表外键约束 addresses_ibfk_1 已添加")
+                logger.debug("addresses 表外键约束 addresses_ibfk_1 已添加")
         except Exception as e:
             # 如果添加外键失败（可能是类型不匹配或表不存在），静默忽略
             logger.debug(f"⚠️ addresses 表外键约束添加失败（已忽略）: {e}")
@@ -611,7 +611,7 @@ class DatabaseManager:
                     ADD CONSTRAINT banner_ibfk_1 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ banner 表外键约束 banner_ibfk_1 已添加")
+                logger.debug("banner 表外键约束 banner_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ banner 表外键约束添加失败（已忽略）: {e}")
 
@@ -633,7 +633,7 @@ class DatabaseManager:
                     ADD CONSTRAINT product_attributes_ibfk_1 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ product_attributes 表外键约束 product_attributes_ibfk_1 已添加")
+                logger.debug("product_attributes 表外键约束 product_attributes_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ product_attributes 表外键约束添加失败（已忽略）: {e}")
 
@@ -655,7 +655,7 @@ class DatabaseManager:
                     ADD CONSTRAINT product_skus_ibfk_1 
                     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
                 """)
-                logger.info("✅ product_skus 表外键约束 product_skus_ibfk_1 已添加")
+                logger.debug("product_skus 表外键约束 product_skus_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ product_skus 表外键约束添加失败（已忽略）: {e}")
 
@@ -680,7 +680,7 @@ class DatabaseManager:
                 "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0)",
                 (name, acc_type)
             )
-        logger.info(f"✅ 初始化 {len(accounts)} 个资金池账户")
+        logger.debug(f"初始化 {len(accounts)} 个资金池账户")
 
     def create_test_data(self, cursor, conn) -> int:
         logger.info("\n--- 创建测试数据 ---")
@@ -693,7 +693,7 @@ class DatabaseManager:
         existing = cursor.fetchone()
         if existing:
             user_id = existing['id']
-            logger.info(f"ℹ️ 测试用户手机号已存在，复用用户ID: {user_id}")
+            logger.debug(f"测试用户手机号已存在，复用用户ID: {user_id}")
         else:
             cursor.execute(
                 "INSERT INTO users (mobile, password_hash, name, status) VALUES (%s, %s, %s, 1)",
@@ -706,7 +706,7 @@ class DatabaseManager:
         cursor.execute("SELECT id FROM products WHERE name = %s", (product_name_member,))
         existing_prod = cursor.fetchone()
         if existing_prod:
-            logger.info(f"ℹ️ 会员商品已存在，跳过插入，product_id={existing_prod['id']}")
+            logger.debug(f"会员商品已存在，跳过插入，product_id={existing_prod['id']}")
         else:
             cursor.execute(
                 """INSERT INTO products (name, is_member_product, user_id, status)
@@ -719,7 +719,7 @@ class DatabaseManager:
         cursor.execute("SELECT id FROM products WHERE name = %s", (product_name_normal,))
         existing_normal = cursor.fetchone()
         if existing_normal:
-            logger.info(f"ℹ️ 普通商品已存在，跳过插入，product_id={existing_normal['id']}")
+            logger.debug(f"普通商品已存在，跳过插入，product_id={existing_normal['id']}")
         else:
             cursor.execute(
                 """INSERT INTO products (name, is_member_product, user_id, status)
@@ -728,7 +728,7 @@ class DatabaseManager:
             )
 
         conn.commit()
-        logger.info(f"✅ 测试数据创建完成 | 用户ID: {user_id}")
+        logger.debug(f"测试数据创建完成 | 用户ID: {user_id}")
         return user_id
 
 
@@ -844,14 +844,14 @@ def auto_receive_task(db_cfg: dict = None):
                             # 注意：settle_to_merchant 函数需要从 order 模块导入
                             # 这里只做订单状态更新，结算逻辑需要单独处理
                             conn.commit()
-                            logger.info(f"[auto_receive] 订单 {row['order_number']} 已自动完成。")
+                            logger.debug(f"[auto_receive] 订单 {row['order_number']} 已自动完成。")
             except Exception as e:
                 logger.error(f"[auto_receive] 异常: {e}")
             time.sleep(3600)  # 每小时检查一次
     
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    logger.info("✅ 自动收货守护进程已启动")
+    logger.info("自动收货守护进程已启动")
 
 
 # ==================== Product 模块相关功能（已移除 SQLAlchemy ORM） ====================
@@ -880,7 +880,7 @@ def _fix_pinyin():
                         updated_count += 1
                 
                 conn.commit()
-                logger.info(f"✅ 商品拼音补全完成，更新了 {updated_count} 条记录")
+                logger.debug(f"商品拼音补全完成，更新了 {updated_count} 条记录")
     except ImportError:
         logger.warning("⚠️ pypinyin 未安装，跳过拼音补全功能")
     except Exception as e:
