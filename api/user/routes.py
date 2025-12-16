@@ -451,7 +451,7 @@ def user_info(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, mobile, name, avatar_path, member_level, referral_code "
+                "SELECT id, mobile, name, avatar_path, member_level, status, referral_code "
                 "FROM users WHERE mobile=%s AND status != %s",
                 (mobile, UserStatus.DELETED.value)
             )
@@ -505,6 +505,7 @@ def user_info(mobile: str):
         name=u["name"],
         avatar_path=u["avatar_path"],
         member_level=u["member_level"],
+        status=u["status"],
         referral_code=u["referral_code"],
         direct_count=direct_count,
         team_total=team_total,
