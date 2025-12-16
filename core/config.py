@@ -82,7 +82,7 @@ class UnilevelLevel(IntEnum):
 # 图片存储在与 main.py 同一级的 user_pic 文件夹
 BASE_PIC_DIR: Final[Path] = Path(__file__).resolve().parent.parent / "user_pic"
 AVATAR_UPLOAD_DIR: Final[Path] = BASE_PIC_DIR / "avatars"
-AVATAR_UPLOAD_DIR.mkdir(exist_ok=True)
+AVATAR_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # ==================== 奖励类型 ====================
 class RewardType(StrEnum):
     REFERRAL = 'referral'
