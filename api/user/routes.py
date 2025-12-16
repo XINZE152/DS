@@ -609,6 +609,17 @@ def bind_referrer(body: BindReferrerReq):
                 "ON DUPLICATE KEY UPDATE referrer_id=%s",
                 (user_id, referrer_id, referrer_id)
             )
+            # 同步更新 users 表中的 referral_id 字段（若不存在则自动创建）
+            cur.execute("SHOW COLUMNS FROM users")
+            user_cols2 = [r['Field'] for r in cur.fetchall()]
+            if "referral_id" not in user_cols2:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN referral_id INT DEFAULT NULL COMMENT '推荐人ID'"
+                )
+                conn.commit()  # 提交 DDL
+
+            # 更新 users.referral_id 为绑定的推荐人 id
+            cur.execute("UPDATE users SET referral_id=%s WHERE id=%s", (referrer_id, user_id))
             conn.commit()
             return {"msg": "ok"}
 
