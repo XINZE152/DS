@@ -46,10 +46,17 @@ class MerchantManager:
                 return orders
 
     @staticmethod
-    def ship(order_number: str) -> bool:
+    def ship(order_number: str, tracking_number: str) -> bool:
+        """
+        发货：写入快递单号并把状态改为 pending_recv
+        """
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE orders SET status='pending_recv' WHERE order_number=%s AND status='pending_ship'", (order_number,))
+                cur.execute(
+                    "UPDATE orders SET status='pending_recv', tracking_number=%s "
+                    "WHERE order_number=%s AND status='pending_ship'",
+                    (tracking_number, order_number)
+                )
                 conn.commit()
                 return cur.rowcount > 0
 
@@ -79,7 +86,8 @@ def m_orders(status: Optional[str] = None):
 
 @router.post("/ship", summary="订单发货")
 def m_ship(body: MShip):
-    return {"ok": MerchantManager.ship(body.order_number)}
+    ok = MerchantManager.ship(body.order_number, body.tracking_number)
+    return {"ok": ok}
 
 @router.post("/approve_refund", summary="审核退款申请")
 def m_refund_audit(body: MRefundAudit):
