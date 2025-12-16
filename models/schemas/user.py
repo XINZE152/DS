@@ -3,6 +3,8 @@ from fastapi import Query
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 from core.config import UserStatus
+from datetime import datetime
+from typing import List
 
 
 
@@ -84,6 +86,7 @@ class UserInfoResp(BaseModel):
     name: Optional[str]
     avatar_path: Optional[str]
     member_level: int
+    status: UserStatus
     referral_code: Optional[str]
     direct_count: int
     team_total: int
@@ -155,5 +158,7 @@ class ChangeMobileReq(BaseModel):
     old_mobile: str
     new_mobile: str
 
-
+class AvatarUploadResp(BaseModel):
+    avatar_urls: List[str]          # ← 与商品图一样返回数组
+    uploaded_at: datetime
 

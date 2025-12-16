@@ -1,11 +1,11 @@
-from fastapi import HTTPException, APIRouter, Request
+from fastapi import HTTPException, APIRouter, Request,File, UploadFile,Path
 import uuid
 import datetime
 
 from models.schemas.user import (
     SetStatusReq, AuthReq, AuthResp, UpdateProfileReq, SelfDeleteReq,
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
-    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query
+    PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp
 )
 
 from core.database import get_conn
@@ -17,6 +17,8 @@ from services.points_service import add_points
 from services.reward_service import TeamRewardService
 from services.director_service import DirectorService
 from services.wechat_service import WechatService
+from typing import List
+
 
 logger = get_logger(__name__)
 
@@ -451,7 +453,7 @@ def user_info(mobile: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, mobile, name, avatar_path, member_level, referral_code "
+                "SELECT id, mobile, name, avatar_path, member_level, status, referral_code "
                 "FROM users WHERE mobile=%s AND status != %s",
                 (mobile, UserStatus.DELETED.value)
             )
@@ -505,6 +507,7 @@ def user_info(mobile: str):
         name=u["name"],
         avatar_path=u["avatar_path"],
         member_level=u["member_level"],
+        status=u["status"],
         referral_code=u["referral_code"],
         direct_count=direct_count,
         team_total=team_total,
@@ -609,6 +612,17 @@ def bind_referrer(body: BindReferrerReq):
                 "ON DUPLICATE KEY UPDATE referrer_id=%s",
                 (user_id, referrer_id, referrer_id)
             )
+            # 同步更新 users 表中的 referral_id 字段（若不存在则自动创建）
+            cur.execute("SHOW COLUMNS FROM users")
+            user_cols2 = [r['Field'] for r in cur.fetchall()]
+            if "referral_id" not in user_cols2:
+                cur.execute(
+                    "ALTER TABLE users ADD COLUMN referral_id INT DEFAULT NULL COMMENT '推荐人ID'"
+                )
+                conn.commit()  # 提交 DDL
+
+            # 更新 users.referral_id 为绑定的推荐人 id
+            cur.execute("UPDATE users SET referral_id=%s WHERE id=%s", (referrer_id, user_id))
             conn.commit()
             return {"msg": "ok"}
 
@@ -1156,3 +1170,26 @@ def get_unilevel(mobile: str):
                 raise HTTPException(status_code=404, detail="用户不存在")
             level = UserService.get_unilevel(u["id"])
             return {"unilevel": level}
+
+@router.post("/user/{user_id}/avatar", summary="上传用户头像", response_model=AvatarUploadResp)
+def upload_avatar(
+    user_id: int = Path(..., gt=0, description="用户ID"),
+    avatar_files: List[UploadFile] = File(
+        [],
+        description="头像文件，1-3张，单张≤2MB，仅JPG/PNG/WEBP，留空则清空头像"
+    )
+):
+    """
+    行为与 /api/products/{id}/images 完全一致：
+    1. Path 参数
+    2. 支持多张（数组）
+    3. 返回数组 URL
+    4. 留空则清空原有头像
+    """
+    try:
+        urls = UserService.upload_avatar(user_id, avatar_files)
+        return AvatarUploadResp(avatar_urls=urls, uploaded_at=datetime.datetime.now())
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"头像上传失败：{e}")
