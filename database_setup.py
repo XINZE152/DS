@@ -81,6 +81,8 @@ class DatabaseManager:
                     withdrawable_balance DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '可提现余额',
                     avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT '头像路径',
                     is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT '判断是不是商家',
+                    six_director INT NULL DEFAULT 0 COMMENT '直推六星人数，用于荣誉董事晋升判定',
+                    six_team INT NULL DEFAULT 0 COMMENT '团队六星人数，用于荣誉董事晋升判定',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),
@@ -134,6 +136,7 @@ class DatabaseManager:
                     pay_way ENUM('wechat') DEFAULT 'wechat',
                     refund_reason TEXT,
                     auto_recv_time DATETIME NULL COMMENT '7 天后自动收货',
+                    tracking_number VARCHAR(64) NULL COMMENT '快递单号',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
@@ -402,6 +405,31 @@ class DatabaseManager:
                     INDEX idx_level (level)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            'directors': """
+                CREATE TABLE IF NOT EXISTS directors (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL UNIQUE COMMENT '用户ID，唯一',
+                    status VARCHAR(20) NOT NULL DEFAULT 'active' COMMENT '状态：active=活跃',
+                    dividend_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '累计分红金额',
+                    activated_at DATETIME NULL COMMENT '激活时间',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_status (status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'director_dividends': """
+                CREATE TABLE IF NOT EXISTS director_dividends (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL COMMENT '用户ID',
+                    period_date DATE NOT NULL COMMENT '分红周期日期',
+                    dividend_amount DECIMAL(14,2) NOT NULL COMMENT '分红金额',
+                    new_sales DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '本期新业绩',
+                    weight INT NOT NULL DEFAULT 1 COMMENT '权重，基于团队六星人数',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    INDEX idx_user_id (user_id),
+                    INDEX idx_period_date (period_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
         }
 
         # 定义必需字段（用于检查和更新已存在的表）
@@ -413,6 +441,11 @@ class DatabaseManager:
                 'is_merchant': 'is_merchant TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'判断是不是商家\'',
                 'status': 'status TINYINT NOT NULL DEFAULT 1',
                 'avatar_path': 'avatar_path VARCHAR(255) NULL DEFAULT NULL COMMENT \'头像路径\'',
+                'six_director': 'six_director INT NULL DEFAULT 0 COMMENT \'直推六星人数，用于荣誉董事晋升判定\'',
+                'six_team': 'six_team INT NULL DEFAULT 0 COMMENT \'团队六星人数，用于荣誉董事晋升判定\'',
+            },
+            'orders': {
+                'tracking_number': 'tracking_number VARCHAR(64) NULL COMMENT \'快递单号\'',
             }
         }
         
@@ -434,6 +467,8 @@ class DatabaseManager:
         self._add_product_attributes_foreign_keys(cursor)
         self._add_product_skus_foreign_keys(cursor)
         self._add_user_unilevel_foreign_keys(cursor)
+        self._add_directors_foreign_keys(cursor)
+        self._add_director_dividends_foreign_keys(cursor)
 
         self._init_finance_accounts(cursor)
         logger.info("数据库表结构初始化完成")
@@ -720,6 +755,76 @@ class DatabaseManager:
                 logger.debug("user_unilevel 表外键约束 user_unilevel_ibfk_1 已添加")
         except Exception as e:
             logger.debug(f"⚠️ user_unilevel 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_directors_foreign_keys(self, cursor):
+        """为 directors 表添加外键约束（如果不存在）"""
+        try:
+            # 检查 directors 表和 users 表是否存在
+            cursor.execute("""
+                SELECT TABLE_NAME 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME IN ('directors', 'users')
+            """)
+            existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
+            
+            if 'directors' not in existing_tables or 'users' not in existing_tables:
+                logger.debug("⚠️ directors 表或 users 表不存在，跳过外键添加")
+                return
+            
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'directors' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
+            
+            if 'directors_ibfk_1' not in existing_fks:
+                cursor.execute("""
+                    ALTER TABLE directors 
+                    ADD CONSTRAINT directors_ibfk_1 
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                """)
+                logger.debug("directors 表外键约束 directors_ibfk_1 已添加")
+        except Exception as e:
+            logger.debug(f"⚠️ directors 表外键约束添加失败（已忽略）: {e}")
+
+    def _add_director_dividends_foreign_keys(self, cursor):
+        """为 director_dividends 表添加外键约束（如果不存在）"""
+        try:
+            # 检查 director_dividends 表和 users 表是否存在
+            cursor.execute("""
+                SELECT TABLE_NAME 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME IN ('director_dividends', 'users')
+            """)
+            existing_tables = {row['TABLE_NAME'] for row in cursor.fetchall()}
+            
+            if 'director_dividends' not in existing_tables or 'users' not in existing_tables:
+                logger.debug("⚠️ director_dividends 表或 users 表不存在，跳过外键添加")
+                return
+            
+            cursor.execute("""
+                SELECT CONSTRAINT_NAME 
+                FROM information_schema.TABLE_CONSTRAINTS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'director_dividends' 
+                AND CONSTRAINT_TYPE = 'FOREIGN KEY'
+            """)
+            existing_fks = [row['CONSTRAINT_NAME'] for row in cursor.fetchall()]
+            
+            if 'director_dividends_ibfk_1' not in existing_fks:
+                cursor.execute("""
+                    ALTER TABLE director_dividends 
+                    ADD CONSTRAINT director_dividends_ibfk_1 
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                """)
+                logger.debug("director_dividends 表外键约束 director_dividends_ibfk_1 已添加")
+        except Exception as e:
+            logger.debug(f"⚠️ director_dividends 表外键约束添加失败（已忽略）: {e}")
 
     def _init_finance_accounts(self, cursor):
         accounts = [
