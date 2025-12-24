@@ -370,12 +370,16 @@ class FinanceService:
             )
             logger.debug(f"池子 {purpose.value} 增加: {alloc_amount:.4f}（已写入流水）")
 
-    def grant_points_on_receive(self, order_no: str, external_conn=None) -> bool:
+    def grant_points_on_receive(self, order_no: str, external_conn=None, require_completed: bool = True) -> bool:
         """
         用户确认收货后发放 member_points 和奖励点数（生产级加固版）
         """
         logger.info(f"[积分发放] 订单{order_no}确认收货，开始处理...")
 
+        if require_completed:
+            logger.info(f"[积分发放] 订单{order_no}确认收货，开始处理...")
+        else:
+            logger.info(f"[积分发放] 订单{order_no}支付后立即发放，开始处理...")
         def _process_points_and_rewards(cur):
             # 先短查询获取订单 id（不使用显式锁，采用幂等条件插入方式处理并发）
             cur.execute(
@@ -395,7 +399,7 @@ class FinanceService:
             order = cur.fetchone()
 
             # 状态与退款检查（幂等性保障）
-            if order['status'] != 'completed':
+            if require_completed and order['status'] != 'completed':
                 logger.warning(f"[积分发放] 订单{order_no}状态为{order['status']}，跳过")
                 return True
 

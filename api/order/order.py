@@ -115,8 +115,23 @@ class OrderManager:
                         prod = cur.fetchone()
                         if not prod:
                             raise HTTPException(status_code=404, detail=f"products 表中不存在 id={it['product_id']}")
+
+                        # sku_id 可选：若未提供则回退查询该商品的首个 sku
+                        sku_id = it.get("sku_id")
+                        if not sku_id:
+                            cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1", (it["product_id"],))
+                            sku_row = cur.fetchone()
+                            if sku_row:
+                                sku_id = sku_row.get('id')
+                            else:
+                                raise HTTPException(status_code=422, detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
+
+                        # price 必须提供（立即购买场景），否则明确报错
+                        if "price" not in it:
+                            raise HTTPException(status_code=422, detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
+
                         items.append({
-                            "sku_id": it["sku_id"],
+                            "sku_id": sku_id,
                             "product_id": it["product_id"],
                             "quantity": it["quantity"],
                             "price": Decimal(str(it["price"])),
@@ -593,6 +608,12 @@ def order_pay(body: OrderPay):
                 coupon_discount=total_coupon_discount,  # ✅ 新增：传递优惠券抵扣金额
                 external_conn=conn  # ✅ 关键修复：传递连接避免卡死
             )
+
+            # 立即发放积分（取消“确认收货”延后发放机制）
+            try:
+                fs.grant_points_on_receive(body.order_number, external_conn=conn, require_completed=False)
+            except Exception as e:
+                logger.error(f"订单{body.order_number}支付后立即发放积分失败: {e}", exc_info=True)
 
             # 5. 更新订单状态（在同一连接内执行，避免锁等待）
             ok = OrderManager.update_status(body.order_number, "pending_ship", external_conn=conn)
