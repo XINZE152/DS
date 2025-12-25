@@ -477,6 +477,7 @@ def order_pay(body: OrderPay):
             order_info = cur.fetchone()
             if not order_info:
                 raise HTTPException(status_code=404, detail="订单不存在")
+            user_id = order_info.get("user_id")
             if order_info["status"] != "pending_pay":
                 raise HTTPException(status_code=400, detail="订单状态不是待付款")
 
