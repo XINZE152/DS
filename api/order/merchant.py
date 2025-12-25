@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, constr
 from typing import Optional, List, Dict, Any
 from core.database import get_conn
-from services.finance_service import get_balance, bind_bank, withdraw
+from services.finance_service import get_balance, withdraw   # 不再用 bind_bank
 from decimal import Decimal
 from .refund import RefundManager
 
@@ -74,12 +74,20 @@ class MRefundAudit(BaseModel):
     approve: bool
     reject_reason: Optional[str] = None
 
-class MBindBank(BaseModel):
-    bank_name: str
-    bank_account: str
-
 class MWithdraw(BaseModel):
     amount: float
+
+class MBindBank(BaseModel):
+    user_id: int
+    bank_name: str
+    bank_account: constr(strip_whitespace=True, min_length=10, max_length=30)
+
+    @field_validator("bank_account")
+    @classmethod
+    def digits_only(cls, v: str) -> str:
+        if not v.isdigit():
+            raise ValueError("银行卡号只能为数字")
+        return v
 
 @router.get("/orders", summary="查询订单列表")
 def m_orders(status: Optional[str] = None):
@@ -95,16 +103,29 @@ def m_refund_audit(body: MRefundAudit):
     MerchantManager.approve_refund(body.order_number, body.approve, body.reject_reason)
     return {"ok": True}
 
-
-
-@router.post("/bind_bank", summary="绑定银行卡")
-def m_bind(body: MBindBank):
-    bind_bank(body.bank_name, body.bank_account)
-    return {"ok": True}
-
-@router.post("/withdraw", summary="申请提现")
+@router.post("/withdraw", summary="申请提现", operation_id="merchant_withdraw")
 def m_withdraw(body: MWithdraw):
     ok = withdraw(Decimal(str(body.amount)))
     if not ok:
         raise HTTPException(status_code=400, detail="余额不足")
+    return {"ok": True}
+
+@router.post("/bind_bank", summary="绑定银行卡", operation_id="merchant_bind_bank")
+def m_bind(body: MBindBank):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM users WHERE id=%s LIMIT 1", (body.user_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="用户不存在")
+            cur.execute(
+                "SELECT id FROM user_bankcards WHERE user_id=%s AND bank_account=%s LIMIT 1",
+                (body.user_id, body.bank_account)
+            )
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail="该银行卡已绑定，无需重复绑定")
+            cur.execute(
+                "INSERT INTO user_bankcards (user_id, bank_name, bank_account) VALUES (%s, %s, %s)",
+                (body.user_id, body.bank_name, body.bank_account)
+            )
+            conn.commit()
     return {"ok": True}

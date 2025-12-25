@@ -31,12 +31,28 @@ class RefundManager:
     def audit(order_number: str, approve: bool = True, reject_reason: Optional[str] = None) -> bool:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                new_status = "success" if approve else "rejected"
-                cur.execute("UPDATE refunds SET status=%s,reject_reason=%s WHERE order_number=%s",
-                            (new_status, reject_reason, order_number))
+                new_status = "refund_success" if approve else "rejected"
+                cur.execute(
+                    "UPDATE refunds SET status=%s, reject_reason=%s WHERE order_number=%s",
+                    (new_status, reject_reason, order_number)
+                )
+                if cur.rowcount == 0:
+                    return False
+
+                # 统一回写 refund_status
+                cur.execute(
+                    "UPDATE orders SET refund_status=%s WHERE order_number=%s",
+                    (new_status, order_number)
+                )
+
                 if approve:
+                    # 同意退款 → 订单状态改为 refund 并资金回滚
                     cur.execute("UPDATE orders SET status='refund' WHERE order_number=%s", (order_number,))
                     reverse_split_on_refund(order_number)
+                else:
+                    # 拒绝退款 → 订单直接完成
+                    cur.execute("UPDATE orders SET status='completed' WHERE order_number=%s", (order_number,))
+
                 conn.commit()
                 return True
 

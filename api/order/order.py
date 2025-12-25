@@ -94,7 +94,7 @@ class OrderManager:
             user_id: int,
             address_id: Optional[int],
             custom_addr: Optional[dict],
-            specifications: Optional[str] = None,  # 新增：规格 JSON 字符串
+            specifications: Optional[str] = None,
             buy_now: bool = False,
             buy_now_items: Optional[List[Dict[str, Any]]] = None,
             delivery_way: str = "platform"
@@ -112,7 +112,6 @@ class OrderManager:
                         if not prod:
                             raise HTTPException(status_code=404, detail=f"products 表中不存在 id={it['product_id']}")
 
-                        # sku_id 可选：若未提供则回退查询该商品的首个 sku
                         sku_id = it.get("sku_id")
                         if not sku_id:
                             cur.execute("SELECT id FROM product_skus WHERE product_id = %s LIMIT 1", (it['product_id'],))
@@ -122,7 +121,6 @@ class OrderManager:
                             else:
                                 raise HTTPException(status_code=422, detail=f"商品 {it['product_id']} 无可用 SKU，请提供 sku_id")
 
-                        # price 必须提供（立即购买场景），否则明确报错
                         if "price" not in it:
                             raise HTTPException(status_code=422, detail=f"buy_now_items 必须包含 price 字段：product_id={it['product_id']}")
 
@@ -133,19 +131,10 @@ class OrderManager:
                             "price": Decimal(str(it["price"])),
                             "is_vip": prod["is_member_product"]
                         })
-                    if custom_addr:
-                        consignee_name = custom_addr.get("consignee_name")
-                        consignee_phone = custom_addr.get("consignee_phone")
-                        province = custom_addr.get("province", "")
-                        city = custom_addr.get("city", "")
-                        district = custom_addr.get("district", "")
-                        shipping_address = custom_addr.get("detail", "")
-                    else:
-                        raise HTTPException(status_code=422, detail="立即购买必须上传 custom_address")
                 else:
                     cur.execute("""
                         SELECT c.product_id,
-                            c.sku_id,            
+                            c.sku_id,
                             c.quantity,
                             s.price,
                             p.is_member_product AS is_vip,
@@ -158,84 +147,81 @@ class OrderManager:
                     items = cur.fetchall()
                     if not items:
                         return None
-                    consignee_name = consignee_phone = province = city = district = shipping_address = None
 
-                # ---------- 2. 订单主表 ----------
+                # ---------- 2. 地址信息 ----------
+                if delivery_way == "pickup":
+                    consignee_name = consignee_phone = province = city = district = shipping_address = ""
+                elif custom_addr:
+                    consignee_name = custom_addr.get("consignee_name")
+                    consignee_phone = custom_addr.get("consignee_phone")
+                    province = custom_addr.get("province", "")
+                    city = custom_addr.get("city", "")
+                    district = custom_addr.get("district", "")
+                    shipping_address = custom_addr.get("detail", "")
+                else:
+                    raise HTTPException(status_code=422, detail="必须上传收货地址或选择自提")
+
+                # ---------- 3. 订单主表 ----------
                 total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
                 has_vip = any(i["is_vip"] for i in items)
                 order_number = datetime.now().strftime("%Y%m%d%H%M%S") + str(user_id) + str(uuid.uuid4().int)[:6]
+                init_status = "pending_recv" if delivery_way == "pickup" else "pending_pay"
 
-                # 规格 JSON 写进 refund_reason（下单时该字段一定空）
                 cur.execute("""
                     INSERT INTO orders(
                         user_id, order_number, total_amount, status, is_vip_item,
                         consignee_name, consignee_phone,
                         province, city, district, shipping_address, delivery_way,
                         pay_way, auto_recv_time, refund_reason, expire_at)
-                    VALUES (%s, %s, %s, 'pending_pay', %s,
+                    VALUES (%s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s, %s,
                             'wechat', %s, %s, %s)
                 """, (
-                    user_id, order_number, total, has_vip,
+                    user_id, order_number, total, init_status, has_vip,
                     consignee_name, consignee_phone,
                     province, city, district, shipping_address, delivery_way,
                     datetime.now() + timedelta(days=7),
                     specifications,
-                    datetime.now() + timedelta(hours=12)
+                    datetime.now() + timedelta(hours=12) if init_status == "pending_pay" else None
                 ))
                 oid = cur.lastrowid
 
-                # ---------- 3. 库存校验 & 扣减 ----------
+                # ---------- 4. 库存校验 & 扣减 ----------
                 structure = get_table_structure(cur, "product_skus")
                 has_stock_field = 'stock' in structure['fields']
-                if has_stock_field:
-                    stock_select = (
-                        f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
-                        if 'stock' in structure['asset_fields']
-                        else _quote_identifier('stock')
-                    )
-                else:
-                    stock_select = f"0 AS {_quote_identifier('stock')}"
+                stock_select = (
+                    f"COALESCE({_quote_identifier('stock')}, 0) AS {_quote_identifier('stock')}"
+                    if has_stock_field and 'stock' in structure['asset_fields']
+                    else _quote_identifier('stock')
+                ) if has_stock_field else "0 AS stock"
 
                 for i in items:
-                    cur.execute(
-                        f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s",  # ✅ 使用 sku_id
-                        (i['sku_id'],)
-                    )
+                    cur.execute(f"SELECT {stock_select} FROM {_quote_identifier('product_skus')} WHERE id=%s", (i['sku_id'],))
                     result = cur.fetchone()
                     current_stock = result.get('stock', 0) if result else 0
                     if current_stock < i["quantity"]:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"商品库存不足：SKU ID {i['sku_id']} 当前库存 {current_stock}，需要 {i['quantity']}"
-                        )
+                        raise HTTPException(status_code=400, detail=f"SKU {i['sku_id']} 库存不足")
 
-                # ---------- 4. 写订单明细 ----------
+                # ---------- 5. 写订单明细 ----------
                 for i in items:
                     cur.execute("""
                         INSERT INTO order_items(order_id, product_id, sku_id, quantity, unit_price, total_price)
                         VALUES (%s, %s, %s, %s, %s, %s)
                     """, (
-                        oid,
-                        i["product_id"],
-                        i["sku_id"],  # 新增
-                        i["quantity"],
-                        i["price"],
-                        Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
+                        oid, i["product_id"], i["sku_id"], i["quantity"],
+                        i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
                     ))
-                # ---------- 5. 扣库存 ----------
+
+                # ---------- 6. 扣库存 ----------
                 if has_stock_field:
                     for i in items:
-                        cur.execute(
-                            "UPDATE product_skus SET stock = stock - %s WHERE id = %s",  # ✅ 使用 sku_id
-                            (i["quantity"], i["sku_id"])
-                        )
+                        cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s", (i["quantity"], i["sku_id"]))
 
-                # ---------- 6. 清空购物车（仅购物车结算场景） ----------
+                # ---------- 7. 清空购物车（仅购物车结算场景） ----------
                 if not buy_now:
                     cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
 
-                # ---------- 7. 资金拆分 ----------
+                # ---------- 8. 资金拆分 ----------
                 split_order_funds(order_number, total, has_vip, cursor=cur)
 
                 conn.commit()

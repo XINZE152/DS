@@ -310,7 +310,7 @@ class DatabaseManager:
                     order_number VARCHAR(50) NOT NULL,
                     refund_type ENUM('return','refund_only') NOT NULL COMMENT 'return=退货退款，refund_only=仅退款',
                     reason TEXT NOT NULL,
-                    status ENUM('applied','seller_ok','success','rejected') DEFAULT 'applied',
+                    status ENUM('applied','seller_ok','refund_success','rejected','seller_rejected') DEFAULT 'applied',
                     reject_reason TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -438,6 +438,17 @@ class DatabaseManager:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
                     INDEX idx_user_id (user_id),
                     INDEX idx_period_date (period_date)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """,
+            'user_bankcards': """
+                CREATE TABLE IF NOT EXISTS user_bankcards (
+                    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT UNSIGNED NOT NULL,
+                    bank_name VARCHAR(50) NOT NULL,
+                    bank_account VARCHAR(30) NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uk_user_card (user_id, bank_account),
+                    CONSTRAINT fk_user_bankcard FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
         }
