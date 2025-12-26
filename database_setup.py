@@ -315,6 +315,7 @@ class DatabaseManager:
                     reason TEXT NOT NULL,
                     status ENUM('applied','seller_ok','refund_success','rejected','seller_rejected') DEFAULT 'applied',
                     reject_reason TEXT,
+                    merchant_address VARCHAR(255) COMMENT '商家退货地址',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_order_number (order_number)
