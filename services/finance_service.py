@@ -3204,16 +3204,26 @@ class FinanceService:
 
                 # 5. 计算期末余额
                 closing_balance = Decimal('0')
-                if records:
-                    closing_balance = Decimal(str(records[0]['balance_after'] or 0))
-                elif user_id:
+                if user_id:
+                    # 【查询单个用户】从明细记录或用户表获取期末余额
+                    if records:
+                        closing_balance = Decimal(str(records[0]['balance_after'] or 0))
+                    else:
+                        cur.execute("""
+                            SELECT COALESCE(member_points, 0) as current_balance
+                            FROM users 
+                            WHERE id = %s
+                        """, (user_id,))
+                        balance_row = cur.fetchone()
+                        closing_balance = Decimal(str(balance_row['current_balance'] if balance_row else 0))
+                else:
+                    # 【查询所有用户】计算总积分作为期末余额
                     cur.execute("""
-                        SELECT COALESCE(member_points, 0) as current_balance
-                        FROM users 
-                        WHERE id = %s
-                    """, (user_id,))
-                    balance_row = cur.fetchone()
-                    closing_balance = Decimal(str(balance_row['current_balance'] if balance_row else 0))
+                        SELECT COALESCE(SUM(member_points), 0) as total_balance
+                        FROM users
+                    """)
+                    total_row = cur.fetchone()
+                    closing_balance = Decimal(str(total_row['total_balance'] if total_row else 0))
 
                 # 6. 获取用户信息
                 user_info = None
