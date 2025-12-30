@@ -89,6 +89,31 @@ class FinanceService:
             logger.error(f"查询用户余额失败: {e}")
             return Decimal('0')
 
+    # ==================== 新增：资金池余额检查辅助方法 ====================
+    def _ensure_pool_balance(self, account_type: str, amount_to_deduct: Decimal) -> None:
+        """
+        确保资金池余额充足，防止扣成负数
+
+        Args:
+            account_type: 资金池类型
+            amount_to_deduct: 要扣减的金额（正值）
+
+        Raises:
+            InsufficientBalanceException: 如果余额不足
+        """
+        if amount_to_deduct <= 0:
+            return  # 不需要扣减，直接返回
+
+        current_balance = self.get_account_balance(account_type)
+        logger.debug(f"检查资金池余额: {account_type} 当前余额: {current_balance}, 需要扣减: {amount_to_deduct}")
+
+        if current_balance < amount_to_deduct:
+            raise InsufficientBalanceException(
+                f"finance_account:{account_type}",
+                amount_to_deduct,
+                current_balance,
+                message=f"资金池 {account_type} 余额不足，当前: {current_balance:.4f}，需要扣减: {amount_to_deduct:.4f}"
+            )
        # ==================== 关键修改：支持外部连接复用，分离优惠券逻辑 ====================
     def settle_order(self, order_no: str, user_id: int, order_id: int,
                      points_to_use: Decimal = Decimal('0'),
@@ -1054,11 +1079,9 @@ class FinanceService:
         发放周补贴（增加 subsidy_points 并扣减 member_points）
 
         关键修复：
-        1. 在扣减积分时同步写入 points_log 流水记录
-        2. 将扣除的积分转入公司积分账户池，并记录资金池流水
-        3. 【新增】从 subsidy_pool 扣除发放的 subsidy_amount
-        4. 【新增】只扣除与发放点数等量的积分（不再是全部积分）
-        5. 【新增】支持手动积分值，发放后根据 auto_clear 标志自动清除
+        1. 在扣减 subsidy_pool 前检查余额是否充足
+        2. 使用 _add_pool_balance 统一处理余额更新和流水记录
+        3. 新增补贴池余额检查
         """
         logger.info("周补贴发放开始（发放专用点数并扣减积分）")
 
@@ -1077,7 +1100,7 @@ class FinanceService:
             logger.warning("❌ 总积分为0，无法发放补贴")
             return False
 
-        # 【关键修改】检查是否有手动调整的积分值
+        # 检查是否有手动调整的积分值
         adjusted_config = self._get_adjusted_points_value()
         if adjusted_config:
             points_value = adjusted_config['value']
@@ -1093,7 +1116,7 @@ class FinanceService:
         logger.info(f"补贴池: ¥{pool_balance} | 总积分: {total_member_points} | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
-        total_points_deducted = Decimal('0')  # 统计总扣除积分
+        total_points_deducted = Decimal('0')
         today = datetime.now().date()
 
         try:
@@ -1119,8 +1142,7 @@ class FinanceService:
                         if points_to_add <= Decimal('0'):
                             continue
 
-                        # 【关键修改1】只扣除与发放点数等量的积分（不再是全部积分）
-                        # 如果用户积分不足，则最多扣除到0
+                        # 只扣除与发放点数等量的积分（不再是全部积分）
                         points_to_deduct = min(points_to_add, member_points)
 
                         if points_to_deduct <= Decimal('0'):
@@ -1137,7 +1159,7 @@ class FinanceService:
                             (points_to_add, user_id)
                         )
 
-                        # ====== 扣减 member_points（等量扣除） ======
+                        # ====== 扣减 member_points ======
                         cur.execute(
                             "UPDATE users SET member_points = member_points - %s WHERE id = %s",
                             (points_to_deduct, user_id)
@@ -1159,35 +1181,26 @@ class FinanceService:
                         )
 
                         # ====== 将扣除的积分转入公司积分池 ======
-                        # 1. 增加公司积分池余额
-                        cur.execute(
-                            "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
-                            (points_to_deduct,)
+                        # 使用 _add_pool_balance（会自动检查余额）
+                        self._add_pool_balance(
+                            cur, 'company_points', points_to_deduct,
+                            f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分",
+                            related_user=user_id
                         )
 
-                        # 2. 获取更新后的公司积分池余额
-                        cur.execute(
-                            "SELECT balance FROM finance_accounts WHERE account_type = %s",
-                            ('company_points',)
-                        )
-                        company_balance = Decimal(str(cur.fetchone()['balance'] or 0))
+                        # 【关键修复】从 subsidy_pool 扣除发放的 subsidy_amount
+                        # 使用 _add_pool_balance 统一处理（带余额保护）
+                        try:
+                            self._add_pool_balance(
+                                cur, 'subsidy_pool', -subsidy_amount,
+                                f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                related_user=None
+                            )
+                        except InsufficientBalanceException:
+                            logger.error(f"补贴池余额不足，无法发放用户{user_id}的补贴")
+                            raise FinanceException("补贴池余额不足，发放失败")
 
-                        # 3. 记录资金池流水
-                        cur.execute(
-                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
-                               flow_type, remark, created_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            ('company_points', user_id, points_to_deduct, company_balance, 'income',
-                             f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分")
-                        )
-
-                        # 【新增】从 subsidy_pool 扣除发放的 subsidy_amount
-                        # 使用 _add_pool_balance 来统一处理余额更新和流水记录
-                        self._add_pool_balance(cur, 'subsidy_pool', -subsidy_amount,
-                                               f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
-                                               related_user=None)
-
-                        # 记录发放历史到 weekly_subsidy_records
+                        # 记录发放历史
                         cur.execute(
                             """INSERT INTO weekly_subsidy_records 
                                (user_id, week_start, subsidy_amount, points_before, points_deducted)
@@ -1206,15 +1219,18 @@ class FinanceService:
                     # 提交事务
                     conn.commit()
 
-            # 【新增】如果设置了 auto_clear=true，发放完成后自动清除手动配置
+            # 如果设置了 auto_clear=true，发放完成后自动清除手动配置
             if auto_clear:
                 logger.info("发放完成，自动清除手动积分值配置")
-                self.adjust_subsidy_points_value(None)  # 清除配置
+                self.adjust_subsidy_points_value(None)
 
             logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，"
                         f"扣除积分{total_points_deducted:.4f}分，涉及{len(users)}个用户")
             return True
 
+        except InsufficientBalanceException:
+            logger.error(f"❌ 周补贴发放失败: 补贴池余额不足")
+            raise FinanceException("补贴池余额不足，无法完成发放")
         except Exception as e:
             logger.error(f"❌ 周补贴发放失败: {e}", exc_info=True)
             return False
@@ -1506,19 +1522,27 @@ class FinanceService:
 
     def _add_pool_balance(self, cur, account_type: str, amount: Decimal, remark: str,
                           related_user: Optional[int] = None) -> Decimal:
-        """对平台/池子类账户增减余额并记录流水"""
+        # 如果是扣减操作，先检查余额
+        if amount < 0:
+            self._ensure_pool_balance(account_type, abs(amount))
+
+        # 执行余额更新（使用原子操作）
         cur.execute(
             "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = %s",
             (amount, account_type)
         )
 
+        # 获取更新后的余额
         cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
         row = cur.fetchone()
         balance_after = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
 
+        # 记录流水
         flow_type = 'income' if amount >= 0 else 'expense'
         self._insert_account_flow(cur, account_type=account_type, related_user=related_user,
                                   change_amount=amount, flow_type=flow_type, remark=remark)
+
+        logger.debug(f"资金池 {account_type} 余额变更: {amount:.4f}，当前余额: {balance_after:.4f}")
         return balance_after
 
     # 关键修改：points_log插入支持DECIMAL(12,4)精度
@@ -2181,18 +2205,18 @@ class FinanceService:
     # ========== 完整函数 2：计算联创星级分红预览 ==========
     def calculate_unilevel_dividend_preview(self) -> Dict[str, Any]:
         """
-        计算联创星级分红预览（展示每个权重的金额）
+        计算联创星级分红预览（展示每个权重的金额 + 用户上限1万）
 
         返回：
-        - 资金池余额（扣除后的预估余额）
-        - 总权重（所有联创星级之和）
+        - 资金池余额
+        - 总权重
         - 每个权重的自动计算金额
         - 是否设置了手动调整
-        - 所有联创用户列表
-        - 【新增】estimated_balance_after: 扣除后的预估余额
-        - 【新增】total_required: 总发放金额
+        - 所有联创用户列表（包含理论金额和实际金额）
+        - total_capped_users: 达到上限的用户数（新增）
+        - capped_users_list: 被限制的用户列表（新增）
         """
-        logger.info("计算联创星级分红预览")
+        logger.info("计算联创星级分红预览（含单个用户上限1万）")
 
         # 1. 查询分红池余额
         pool_balance = self.get_account_balance('honor_director')
@@ -2200,15 +2224,8 @@ class FinanceService:
         # 2. 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # === 关键修复：使用 JOIN + BETWEEN 替代 EXISTS ===
                 cur.execute("SET time_zone = '+08:00'")
 
-                # 1. 查询分红池余额
-                cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'honor_director'")
-                row = cur.fetchone()
-                pool_balance = Decimal(str(row['balance'] if row and row['balance'] is not None else 0))
-
-                # 2. ✅ 修正查询：使用 INNER JOIN + GROUP BY
                 cur.execute("""
                     SELECT uu.user_id, uu.level, u.name, u.member_level
                     FROM user_unilevel uu
@@ -2224,8 +2241,6 @@ class FinanceService:
                 """)
                 unilevel_users = cur.fetchall()
 
-                logger.error(f"=== DEBUG: 联创用户数={len(unilevel_users)}，数据={unilevel_users}")
-
         if not unilevel_users:
             return {
                 "pool_balance": float(pool_balance),
@@ -2235,8 +2250,10 @@ class FinanceService:
                 "adjustment_configured": False,
                 "adjusted_amount": None,
                 "will_use_adjusted": False,
-                "estimated_balance_after": float(pool_balance),  # 无发放，余额不变
+                "estimated_balance_after": float(pool_balance),
                 "total_required": 0.0,
+                "total_capped_users": 0,  # 新增
+                "capped_users_list": [],  # 新增
                 "users": []
             }
 
@@ -2249,15 +2266,51 @@ class FinanceService:
         # 5. 检查是否有手动调整配置
         adjusted_amount = self._get_adjusted_unilevel_amount()
 
-        # 6. 预估扣除后的余额和总发放金额
+        # 6. 确定使用哪个金额
         if adjusted_amount is not None:
             amount_per_weight = adjusted_amount
-            total_required = amount_per_weight * total_weight
-            estimated_balance_after = pool_balance - total_required
+            will_use_adjusted = True
         else:
             amount_per_weight = amount_per_weight_auto
-            total_required = amount_per_weight * total_weight
-            estimated_balance_after = pool_balance - total_required
+            will_use_adjusted = False
+
+        # 7. 计算每个用户的金额并检查上限
+        MAX_PER_USER = Decimal('10000')
+        total_capped_users = 0
+        capped_users_list = []
+        users_data = []
+
+        for user in unilevel_users:
+            weight = Decimal(str(user['level']))
+            theoretical_dividend = amount_per_weight * weight
+            actual_dividend = min(theoretical_dividend, MAX_PER_USER)
+
+            # 检查是否被限制
+            is_capped = theoretical_dividend > actual_dividend
+            if is_capped:
+                total_capped_users += 1
+                capped_users_list.append({
+                    "user_id": user['user_id'],
+                    "user_name": user['name'],
+                    "weight": int(weight),
+                    "theoretical_dividend": float(theoretical_dividend),
+                    "actual_dividend": float(actual_dividend)
+                })
+
+            users_data.append({
+                "user_id": user['user_id'],
+                "user_name": user['name'],
+                "unilevel_level": user['level'],
+                "member_level": user['member_level'],
+                "weight": int(weight),
+                "theoretical_dividend": float(theoretical_dividend),  # 理论金额
+                "actual_dividend": float(actual_dividend),  # 实际金额（受上限影响）
+                "is_capped": is_capped  # 是否被限制
+            })
+
+        # 8. 预估扣除后的余额（基于理论最大值）
+        total_theoretical_required = amount_per_weight * total_weight
+        estimated_balance_after = pool_balance - total_theoretical_required
 
         return {
             "pool_balance": float(pool_balance),
@@ -2266,32 +2319,32 @@ class FinanceService:
             "user_count": len(unilevel_users),
             "adjustment_configured": adjusted_amount is not None,
             "adjusted_amount": float(adjusted_amount) if adjusted_amount else None,
-            "will_use_adjusted": adjusted_amount is not None,
-            "estimated_balance_after": float(estimated_balance_after),  # 新增
-            "total_required": float(total_required),  # 新增
-            "users": [
-                {
-                    "user_id": user['user_id'],
-                    "user_name": user['name'],
-                    "unilevel_level": user['level'],
-                    "member_level": user['member_level'],
-                    "weight": int(user['level']),
-                    "estimated_dividend": float(
-                        amount_per_weight_auto * Decimal(str(user['level']))) if adjusted_amount is None else float(
-                        adjusted_amount * Decimal(str(user['level'])))
-                } for user in unilevel_users
-            ]
+            "will_use_adjusted": will_use_adjusted,
+            "estimated_balance_after": float(estimated_balance_after),
+            "total_theoretical_required": float(total_theoretical_required),
+            "total_capped_users": total_capped_users,  # 达到上限的用户数
+            "capped_users_list": capped_users_list,  # 被限制的用户详情
+            "users": users_data
         }
 
     # ========== 完整函数 3：手动调整联创分红金额 ==========
-    def adjust_unilevel_dividend_amount(self, amount_per_weight: Optional[float] = None) -> bool:
+    def adjust_unilevel_dividend_amount(self, amount_per_weight: Optional[float] = None) -> Dict[str, Any]:
         """
-        手动调整联创星级分红金额
+        手动调整联创星级分红金额（增加上限预警）
 
         Args:
-            amount_per_weight: 每个权重的分红金额，传入None表示取消手动调整，恢复自动计算
+            amount_per_weight: 每个权重的分红金额，传入None表示取消调整
+
+        Returns:
+            dict: 包含是否成功、消息和警告信息（如果存在用户超限）
         """
         try:
+            result = {
+                "success": True,
+                "message": "",
+                "warning": None  # 新增：警告信息
+            }
+
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     if amount_per_weight is None:
@@ -2299,6 +2352,7 @@ class FinanceService:
                         cur.execute(
                             "UPDATE finance_accounts SET config_params = NULL WHERE account_type = 'honor_director'"
                         )
+                        result["message"] = "已取消联创分红手动调整，恢复自动计算"
                         logger.info("已取消联创分红手动调整，恢复自动计算")
                     else:
                         # 设置调整金额
@@ -2306,39 +2360,84 @@ class FinanceService:
                         if amount < 0:
                             raise FinanceException("分红金额不能为负数")
 
+                        # ==================== 新增：检查可能超限的用户 ====================
+                        MAX_PER_USER = Decimal('10000')
+                        cur.execute("""
+                            SELECT uu.user_id, u.name, uu.level as weight
+                            FROM user_unilevel uu
+                            JOIN users u ON uu.user_id = u.id
+                            INNER JOIN (
+                                SELECT DISTINCT o.user_id
+                                FROM orders o
+                                WHERE o.status IN ('pending_ship','pending_recv','completed')
+                                  AND o.created_at >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+                                  AND o.created_at < DATE_ADD(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+                            ) AS active_users ON uu.user_id = active_users.user_id
+                            WHERE uu.level IN (1, 2, 3)
+                        """)
+                        unilevel_users = cur.fetchall()
+
+                        capped_users = []
+                        for user in unilevel_users:
+                            weight = int(user['weight'])
+                            theoretical_amount = amount * Decimal(str(weight))
+
+                            if theoretical_amount > MAX_PER_USER:
+                                capped_users.append({
+                                    "user_id": user['user_id'],
+                                    "user_name": user['name'],
+                                    "weight": weight,
+                                    "theoretical_amount": float(theoretical_amount),
+                                    "actual_amount": float(MAX_PER_USER)
+                                })
+
+                        # 如果有用户超限，生成警告信息
+                        if capped_users:
+                            max_theoretical = max(user['theoretical_amount'] for user in capped_users)
+                            result["warning"] = {
+                                "type": "user_dividend_cap_reached",
+                                "message": f"当前设置会导致 {len(capped_users)} 个用户达到上限10,000元",
+                                "capped_user_count": len(capped_users),
+                                "max_theoretical_amount": float(max_theoretical),
+                                "capped_users": capped_users[:10]  # 只返回前10个，避免数据过大
+                            }
+                            logger.warning(
+                                f"联创分红手动调整设定 ¥{amount:.4f}/权重 "
+                                f"将导致 {len(capped_users)} 个用户达到上限10,000元"
+                            )
+                        # ===================================================================
+
                         import json
                         config = json.dumps({"fixed_amount_per_weight": str(amount)})
                         cur.execute(
                             "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'honor_director'",
                             (config,)
                         )
+                        result["message"] = f"联创分红金额已调整为: ¥{amount:.4f}/权重"
                         logger.info(f"已设置联创分红手动调整: ¥{amount:.4f}/权重")
 
                     conn.commit()
 
-            return True
+            return result
+
         except Exception as e:
             logger.error(f"调整分红金额失败: {e}")
             raise
 
     def distribute_unilevel_dividend(self) -> bool:
         """
-        发放联创星级分红（支持手动调整）
+        发放联创星级分红（支持手动调整，新增余额保护 + 单个用户上限1万）
 
         关键修改：
-        1. 检查手动调整配置
-        2. 优先使用手动调整的金额
-        3. 计算所需总额并检查余额
-        4. 执行分红发放
-        5. 【新增】从 honor_director 池扣除发放的 points_to_add
-        6. 成功后清除手动调整配置
+        1. 新增：每个用户发放金额上限10,000元
+        2. 保留：余额检查、资金池扣减等保护逻辑
+        3. 记录：超限情况日志，便于审计
         """
-        logger.info("联创星级分红发放开始（检测手动调整配置）")
+        logger.info("联创星级分红发放开始（检测手动调整配置 + 用户上限1万）")
 
         # 查询所有联创用户
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # === 使用相同的 JOIN 查询 ===
                 cur.execute("SET time_zone = '+08:00'")
 
                 cur.execute("""
@@ -2378,7 +2477,7 @@ class FinanceService:
             amount_per_weight = adjusted_amount
             total_required = amount_per_weight * total_weight
 
-            # 关键：检查余额是否足够
+            # 关键：检查余额是否足够（在事务开始前检查）
             if total_required > pool_balance:
                 raise FinanceException(
                     f"资金池余额不足。手动调整需要¥{total_required:.4f}，"
@@ -2395,13 +2494,30 @@ class FinanceService:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     total_distributed = Decimal('0')
+                    total_limited = 0  # 记录被限制的用户数
 
                     for user in unilevel_users:
                         user_id = user['user_id']
                         weight = Decimal(str(user['level']))
-                        points_to_add = amount_per_weight * weight
 
-                        # 发放点数到 users.points
+                        # 计算理论发放金额
+                        theoretical_amount = amount_per_weight * weight
+
+                        # ==================== 新增：限制单个用户上限10,000元 ====================
+                        MAX_PER_USER = Decimal('10000.0000')
+                        actual_amount = min(theoretical_amount, MAX_PER_USER)
+
+                        if actual_amount != theoretical_amount:
+                            total_limited += 1
+                            logger.warning(
+                                f"用户{user_id}联创分红金额超限: {theoretical_amount:.4f} -> {actual_amount:.4f} "
+                                f"(权重:{weight}, 上限:{MAX_PER_USER})"
+                            )
+                        # ===================================================================
+
+                        points_to_add = actual_amount
+
+                        # 给用户发放点数
                         cur.execute(
                             "UPDATE users SET points = COALESCE(points, 0) + %s WHERE id = %s",
                             (points_to_add, user_id)
@@ -2415,16 +2531,23 @@ class FinanceService:
 
                         # 记录流水
                         cur.execute("""
-                            INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                            INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, 
+                            flow_type, remark, created_at)
                             VALUES (%s, %s, %s, %s, %s, %s, NOW())
                         """, ('honor_director', user_id, points_to_add, 0, 'income',
                               f"联创{weight}星级分红（权重{weight}/{total_weight}）"))
 
-                        # 【新增】从 honor_director 池扣除发放的 points_to_add
-                        # 使用 _add_pool_balance 来统一处理余额更新和流水记录
-                        self._add_pool_balance(cur, 'honor_director', -points_to_add,
-                                               f"联创星级分红发放 - 用户{user_id}获得{points_to_add:.4f}点数",
-                                               related_user=None)
+                        # 【关键修复】从 honor_director 池扣除发放的 points_to_add
+                        # 使用 _add_pool_balance（带余额保护）
+                        try:
+                            self._add_pool_balance(
+                                cur, 'honor_director', -points_to_add,
+                                f"联创星级分红发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                related_user=None
+                            )
+                        except InsufficientBalanceException:
+                            logger.error(f"联创分红池余额不足，无法发放用户{user_id}的分红")
+                            raise FinanceException("联创分红池余额不足，发放失败")
 
                         total_distributed += points_to_add
                         logger.debug(f"用户{user_id}获得联创星级分红: {points_to_add:.4f}点数")
@@ -2436,9 +2559,19 @@ class FinanceService:
                 logger.info("分红完成，清除手动调整配置")
                 self.adjust_unilevel_dividend_amount(None)
 
-            logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}")
+            # ==================== 新增：记录被限制的用户数 ====================
+            if total_limited > 0:
+                logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}，"
+                            f"其中{total_limited}人达到上限10,000元")
+            else:
+                logger.info(f"联创星级分红完成: 共{len(unilevel_users)}人，发放点数{total_distributed:.4f}")
+            # ===================================================================
+
             return True
 
+        except InsufficientBalanceException:
+            logger.error(f"❌ 联创星级分红失败: 分红池余额不足")
+            raise FinanceException("联创分红池余额不足，无法完成发放")
         except Exception as e:
             logger.error(f"联创星级分红失败: {e}", exc_info=True)
             return False
@@ -3506,7 +3639,7 @@ class FinanceService:
                 }
 
     def clear_fund_pools(self, pool_types: List[str]) -> Dict[str, Any]:
-        """清空指定的资金池"""
+        """清空指定的资金池（增加余额保护）"""
         logger.info(f"开始清空资金池: {pool_types}")
 
         if not pool_types:
@@ -3518,7 +3651,7 @@ class FinanceService:
             if pool_type not in valid_pools:
                 raise FinanceException(f"无效的资金池类型: {pool_type}")
 
-        # ============= 关键修改：事务外查询余额 =============
+        # 事务外查询余额
         pools_to_clear = []
         for pool_type in pool_types:
             current_balance = self.get_account_balance(pool_type)
@@ -3549,7 +3682,6 @@ class FinanceService:
                 "total_cleared": 0.0
             }
 
-        # ============= 关键修改：使用 get_conn() 替代 self.session =============
         cleared_pools = []
         total_cleared = Decimal('0')
 
@@ -3561,30 +3693,27 @@ class FinanceService:
                         account_name = pool_info["account_name"]
                         current_balance = pool_info["balance"]
 
-                        # 执行清空操作
-                        cur.execute(
-                            "UPDATE finance_accounts SET balance = 0 WHERE account_type = %s",
-                            (pool_type,)
-                        )
+                        # 执行清空操作（使用 _add_pool_balance 带余额保护）
+                        try:
+                            self._add_pool_balance(
+                                cur, pool_type, -current_balance,
+                                f"手动清空资金池 - 清空金额¥{current_balance:.2f}",
+                                related_user=None
+                            )
 
-                        # 记录流水
-                        cur.execute(
-                            """INSERT INTO account_flow (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                               VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                            (pool_type, None, -current_balance, 0, 'expense', "手动清空资金池")
-                        )
+                            cleared_pools.append({
+                                "account_type": pool_type,
+                                "account_name": account_name,
+                                "amount_cleared": float(current_balance),
+                                "previous_balance": float(current_balance)
+                            })
+                            total_cleared += current_balance
 
-                        cleared_pools.append({
-                            "account_type": pool_type,
-                            "account_name": account_name,
-                            "amount_cleared": float(current_balance),
-                            "previous_balance": float(current_balance)
-                        })
-                        total_cleared += current_balance
+                            logger.info(f"已清空资金池 {pool_type}: ¥{current_balance:.2f}")
+                        except InsufficientBalanceException:
+                            logger.error(f"资金池 {pool_type} 余额不足，无法清空")
+                            raise FinanceException(f"资金池 {pool_type} 余额不足，清空失败")
 
-                        logger.info(f"已清空资金池 {pool_type}: ¥{current_balance:.2f}")
-
-                    # 提交事务
                     conn.commit()
 
             logger.info(f"资金池清空完成: 共清空 {len(cleared_pools)} 个，总计 ¥{total_cleared:.2f}")
@@ -3597,10 +3726,6 @@ class FinanceService:
         except Exception as e:
             logger.error(f"清空资金池失败: {e}", exc_info=True)
             raise
-
-    # services/finance_service.py
-
-    # ... 在 clear_fund_pools 方法之后添加 ...
 
     def get_weekly_subsidy_report(self, year: int, week: int, user_id: Optional[int] = None,
                                   page: int = 1, page_size: int = 20) -> Dict[str, Any]:
