@@ -461,7 +461,7 @@ class DatabaseManager:
                     bank_name VARCHAR(50) NOT NULL,
                     bank_account VARCHAR(30) NOT NULL,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY uk_user_card (user_id, bank_account),
+                    INDEX idx_user_card (user_id, bank_account),
                     CONSTRAINT fk_user_bankcard FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
@@ -571,6 +571,13 @@ class DatabaseManager:
                     verify_result ENUM('VERIFY_SUCCESS','VERIFY_FAIL','VERIFYING')
                         NOT NULL DEFAULT 'VERIFYING' COMMENT '验证结果',
                     verify_fail_reason VARCHAR(1024) NULL COMMENT '验证失败原因',
+                    modify_application_no VARCHAR(64) DEFAULT NULL COMMENT '改绑申请单号',
+                    modify_fail_reason VARCHAR(255) DEFAULT NULL COMMENT '改绑失败原因',
+                            -- ✅ 新增字段：改绑临时存储
+                    new_account_number_encrypted TEXT NULL COMMENT '改绑-新卡号(加密)',
+                    new_account_name_encrypted TEXT NULL COMMENT '改绑-新户名(加密)',
+                    new_bank_name VARCHAR(128) NULL COMMENT '改绑-新开户行',
+                    old_account_backup JSON NULL COMMENT '改绑-旧卡备份{number,name,bank}',
                     is_default TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否默认账户：1默认',
                     status TINYINT(1) NOT NULL DEFAULT 1 COMMENT '账户状态：1启用/0禁用',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -621,6 +628,39 @@ class DatabaseManager:
                     INDEX idx_created_at (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """,
+            'merchant_stores': """
+            CREATE TABLE IF NOT EXISTS merchant_stores (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT '店铺ID',
+                user_id BIGINT UNSIGNED NOT NULL UNIQUE COMMENT '商家用户ID（唯一）',
+                store_name VARCHAR(100) NOT NULL COMMENT '店铺名称',
+                store_logo_image_id VARCHAR(100) COMMENT '店铺LOGO图片ID',
+                store_description VARCHAR(500) COMMENT '店铺简介',
+                contact_name VARCHAR(20) NOT NULL COMMENT '联系人姓名',
+                contact_phone VARCHAR(11) NOT NULL COMMENT '联系人手机号',
+                contact_email VARCHAR(100) COMMENT '联系人邮箱',
+                business_hours VARCHAR(100) COMMENT '营业时间',
+                store_address VARCHAR(200) COMMENT '店铺地址',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_user_id (user_id),
+                INDEX idx_store_name (store_name),
+                CONSTRAINT fk_merchant_stores_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+
+            'store_logos': """
+            CREATE TABLE IF NOT EXISTS store_logos (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'LOGO ID',
+                image_id VARCHAR(100) NOT NULL UNIQUE COMMENT '图片ID（唯一）',
+                user_id BIGINT UNSIGNED NOT NULL COMMENT '商家用户ID',
+                file_path VARCHAR(500) NOT NULL COMMENT '文件存储路径',
+                file_size INT NOT NULL COMMENT '文件大小（字节）',
+                upload_time DATETIME NOT NULL COMMENT '上传时间',
+                INDEX idx_user_id (user_id),
+                INDEX idx_image_id (image_id),
+                CONSTRAINT fk_store_logos_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
         }
 
         # 定义必需字段（用于检查和更新已存在的表）
@@ -638,6 +678,7 @@ class DatabaseManager:
                 'team_reward_points': 'team_reward_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'团队奖励专用点数\'',
                 'referral_points': 'referral_points DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'推荐奖励专用点数\'',
                 'wechat_sub_mchid': 'wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT \'微信特约商户号\'',
+                'has_store_permission': 'has_store_permission TINYINT(1) NOT NULL DEFAULT 0 COMMENT \'是否开通开店权限（支付进件成功后置为1）\'',
             },
             'orders': {
                 'tracking_number': 'tracking_number VARCHAR(64) NULL COMMENT \'快递单号\'',
@@ -656,6 +697,13 @@ class DatabaseManager:
             # 联创星级分红手动调整配置字段
             'finance_accounts': {
                 'config_params': "config_params JSON DEFAULT NULL COMMENT '资金池配置参数（如：fixed_amount_per_weight）'"
+            },
+            'merchant_settlement_accounts': {
+                # ✅ 新增改绑相关字段
+                'new_account_number_encrypted': "new_account_number_encrypted TEXT NULL COMMENT '改绑-新卡号(加密)'",
+                'new_account_name_encrypted': "new_account_name_encrypted TEXT NULL COMMENT '改绑-新户名(加密)'",
+                'new_bank_name': "new_bank_name VARCHAR(128) NULL COMMENT '改绑-新开户行'",
+                'old_account_backup': "old_account_backup JSON NULL COMMENT '改绑-旧卡备份{number,name,bank}'",
             },
             'coupons': {
                 # 检查并添加 applicable_product_type 字段
