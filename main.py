@@ -26,6 +26,7 @@ from api.user.routes import register_routes as register_user_routes
 from api.order import register_routes as register_order_routes
 from api.product.routes import register_routes as register_product_routes
 from api.system.routes import register_routes as register_system_routes
+from api.store_setup.routes import register_store_routes
 
 
 def ensure_database():
@@ -84,6 +85,9 @@ tags_metadata = [
     {
         "name": "系统配置",
         "description": "系统配置相关接口，包括系统标语、轮播图标语等配置管理。",
+    }, {
+        "name": "店铺设置",
+        "description": "店铺设置相关接口，包括店铺信息创建、更新、查询、LOGO上传、设置状态查询等功能。",
     },
 ]
 
@@ -103,7 +107,7 @@ register_user_routes(app)
 register_order_routes(app)
 register_product_routes(app)
 register_system_routes(app)
-
+register_store_routes(app)
 
 # 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
 # 注意：必须在路由注册之后设置，否则 schema 中不会包含路由
