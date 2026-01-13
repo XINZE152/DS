@@ -29,7 +29,7 @@ class BankcardBindRequest(BaseModel):
         return v
 
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "account_name": "张三",
                 "account_number": "6222021234567890000",
@@ -59,7 +59,7 @@ class BankcardModifyRequest(BaseModel):
         return v
 
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "new_account_name": "李四",
                 "new_account_number": "6222029876543210000",

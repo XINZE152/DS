@@ -320,6 +320,34 @@ wheels = [
 ]
 
 [[package]]
+name = "httpcore"
+version = "1.0.9"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "certifi" },
+    { name = "h11" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55" },
+]
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "anyio" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "idna" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad" },
+]
+
+[[package]]
 name = "idna"
 version = "3.11"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -635,6 +663,7 @@ dependencies = [
     { name = "crypto" },
     { name = "cryptography" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pillow" },
     { name = "pycryptodome" },
     { name = "pydantic" },
@@ -646,6 +675,8 @@ dependencies = [
     { name = "python-multipart" },
     { name = "requests" },
     { name = "uvicorn" },
+    { name = "wechatpayv3" },
+    { name = "xmltodict" },
 ]
 
 [package.metadata]
@@ -655,6 +686,7 @@ requires-dist = [
     { name = "crypto", specifier = ">=1.4.1" },
     { name = "cryptography", specifier = ">=46.0.3" },
     { name = "fastapi", specifier = ">=0.123.9" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pillow", specifier = ">=12.0.0" },
     { name = "pycryptodome", specifier = ">=3.20.0" },
     { name = "pydantic", specifier = ">=2.12.5" },
@@ -666,6 +698,8 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "uvicorn", specifier = ">=0.38.0" },
+    { name = "wechatpayv3", specifier = ">=2.0.1" },
+    { name = "xmltodict", specifier = ">=1.0.2" },
 ]
 
 [[package]]
@@ -742,4 +776,26 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/cb/ce/f06b84e2697fef4688ca63bdb2fdf113ca0a3be33f94488f2cadb690b0cf/uvicorn-0.38.0.tar.gz", hash = "sha256:fd97093bdd120a2609fc0d3afe931d4d4ad688b6e75f0f929fde1bc36fe0e91d" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/ee/d9/d88e73ca598f4f6ff671fb5fde8a32925c2e08a637303a1d12883c7305fa/uvicorn-0.38.0-py3-none-any.whl", hash = "sha256:48c0afd214ceb59340075b4a052ea1ee91c16fbc2a9b1469cca0e54566977b02" },
+]
+
+[[package]]
+name = "wechatpayv3"
+version = "2.0.1"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "requests" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/0b/44/2fc2dc2e1c7622271cdf21fb9e3eeffcc56ef19013043e4cb55bfa6d8727/wechatpayv3-2.0.1.tar.gz", hash = "sha256:9ed704cdca046691ffbf882c7ebe32b1ae9b66300d68dba45dd3ff8513cf603a" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/c1/fd/636287aed9f6520b55c19fcefcbd339e3d3e54d4df5d915b11ec5fa34079/wechatpayv3-2.0.1-py3-none-any.whl", hash = "sha256:137a0d616fcaf1e643dce7a5c0bfa3b52cc3dd424eb51695c65ced85d365cafc" },
+]
+
+[[package]]
+name = "xmltodict"
+version = "1.0.2"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/6a/aa/917ceeed4dbb80d2f04dbd0c784b7ee7bba8ae5a54837ef0e5e062cd3cfb/xmltodict-1.0.2.tar.gz", hash = "sha256:54306780b7c2175a3967cad1db92f218207e5bc1aba697d887807c0fb68b7649" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/c0/20/69a0e6058bc5ea74892d089d64dfc3a62ba78917ec5e2cfa70f7c92ba3a5/xmltodict-1.0.2-py3-none-any.whl", hash = "sha256:62d0fddb0dcbc9f642745d8bbf4d81fd17d6dfaec5a15b5c1876300aad92af0d" },
 ]
