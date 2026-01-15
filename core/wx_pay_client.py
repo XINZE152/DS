@@ -1,5 +1,5 @@
 # core/wx_pay_client.py
-# 微信支付V3 API客户端（生产级，支持公钥ID方式自动下载平台证书）
+# 微信支付V3 API客户端（生产级，本地公钥ID模式）
 import os
 import hashlib
 import time
@@ -10,18 +10,17 @@ import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
 import requests
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography import x509  # ✅ 正确导入
 
 from core.config import (
     WECHAT_PAY_MCH_ID, WECHAT_PAY_API_V3_KEY,
     WECHAT_PAY_API_CERT_PATH, WECHAT_PAY_API_KEY_PATH,
-    WECHAT_PAY_PLATFORM_CERT_PATH, WECHAT_PAY_PUBLIC_KEY_PATH,
-    WECHAT_APP_ID, WECHAT_APP_SECRET,
-    ENVIRONMENT, WECHAT_PAY_PUB_KEY_ID
+    WECHAT_PAY_PUBLIC_KEY_PATH, WECHAT_PAY_PUB_KEY_ID,
+    WECHAT_APP_ID, WECHAT_APP_SECRET, ENVIRONMENT
 )
 from core.database import get_conn
 from core.logging import get_logger
@@ -31,7 +30,7 @@ logger = get_logger(__name__)
 
 
 class WeChatPayClient:
-    """微信支付V3 API客户端（生产级，支持公钥ID方式自动下载平台证书）"""
+    """微信支付V3 API客户端（生产级，本地公钥ID模式）"""
 
     BASE_URL = "https://api.mch.weixin.qq.com"
 
@@ -64,16 +63,12 @@ class WeChatPayClient:
         self.apiv3_key = WECHAT_PAY_API_V3_KEY.encode('utf-8')
         self.cert_path = WECHAT_PAY_API_CERT_PATH
         self.key_path = WECHAT_PAY_API_KEY_PATH
-
-        # 修复：优先使用 WECHAT_PAY_PUBLIC_KEY_PATH，回退到 WECHAT_PAY_PLATFORM_CERT_PATH
-        self.platform_cert_path = WECHAT_PAY_PUBLIC_KEY_PATH or WECHAT_PAY_PLATFORM_CERT_PATH
-
         self.pub_key_id = WECHAT_PAY_PUB_KEY_ID
 
-        # 修复：初始化序列号缓存属性（关键修复）
+        # 初始化序列号缓存
         self._cached_serial_no = None
 
-        # 初始化HTTP连接池（用于调用微信支付API）
+        # 初始化HTTP连接池
         self.session = requests.Session()
         self.session.mount('https://', requests.adapters.HTTPAdapter(
             pool_connections=10,
@@ -83,145 +78,62 @@ class WeChatPayClient:
 
         # 加载密钥和公钥
         self.private_key = self._load_private_key()
-        self.wechat_public_key = self._load_wechat_public_key()
+        self.wechat_public_key = self._load_wechat_public_key_from_file()
 
         # 初始化Mock测试数据
         if self.mock_mode:
             self._ensure_mock_applyment_exists()
 
-    # ==================== 公钥加载（支持自动下载） ====================
+    # ==================== 微信支付公钥加载（本地文件） ====================
 
-    def _load_wechat_public_key(self):
-        """加载微信支付平台公钥（支持公钥ID自动下载）"""
-
-        # 方式A：通过公钥ID自动下载
-        pub_key_id = os.getenv('WECHAT_PAY_PUB_KEY_ID')
-        if pub_key_id and pub_key_id.startswith('PUB_KEY_'):
-            try:
-                return self._download_and_cache_platform_cert(pub_key_id)
-            except Exception as e:
-                logger.error(f"公钥ID方式获取证书失败: {e}")
-                # ✅ 生产环境不允许回退到文件方式
-                if not self.mock_mode and ENVIRONMENT == 'production':
-                    raise
-
-        # 方式B：回退到传统文件方式（仅开发/测试环境）
-        try:
-            if not os.path.exists(self.platform_cert_path):
-                # ✅ 如果文件不存在且是生产环境，抛出明确错误
-                if ENVIRONMENT == 'production':
-                    raise FileNotFoundError(
-                        f"生产环境必须配置有效的平台证书。请检查：\n"
-                        f"1. WECHAT_PAY_PUB_KEY_ID 是否配置正确（必须以PUB_KEY_开头）\n"
-                        f"2. 或确保 WECHAT_PAY_PUBLIC_KEY_PATH 指向有效文件: {self.platform_cert_path}"
-                    )
-                # 非生产环境可以跳过
-                logger.warning("平台证书文件不存在，将跳过验签（仅限开发环境）")
-                return None
-
-            with open(self.platform_cert_path, 'rb') as f:
-                return serialization.load_pem_public_key(
-                    f.read(),
-                    backend=default_backend()
-                )
-        except Exception as e:
-            logger.error(f"加载微信支付平台公钥失败: {e}")
-            if not self.mock_mode:
-                raise
+    def _load_wechat_public_key_from_file(self) -> Any:
+        """从本地文件加载微信支付公钥（2024年后公钥ID模式）"""
+        if self.mock_mode:
             return None
 
-    def _download_and_cache_platform_cert(self, pub_key_id: str):
-        """从微信API下载平台证书并缓存到本地（修复版）"""
+        # 强制校验：公钥ID必须配置
+        if not self.pub_key_id or not self.pub_key_id.startswith('PUB_KEY_ID_'):
+            raise RuntimeError(
+                f"微信支付公钥ID配置错误: {self.pub_key_id}\n"
+                f"2024年后新商户必须从微信支付后台获取公钥ID（格式: PUB_KEY_ID_开头）"
+            )
 
-        # ✅ 修复：确保使用商户证书序列号
-        merchant_serial_no = self._get_merchant_serial_no()
+        # 读取本地公钥文件
+        if not WECHAT_PAY_PUBLIC_KEY_PATH or not os.path.exists(WECHAT_PAY_PUBLIC_KEY_PATH):
+            raise FileNotFoundError(
+                f"微信支付公钥文件不存在: {WECHAT_PAY_PUBLIC_KEY_PATH}\n"
+                f"请登录微信支付商户平台，进入【账户中心】->【API安全】->【微信支付公钥】下载公钥文件"
+            )
 
-        # ✅ 修复：GET 请求，body 为空字符串
-        timestamp = str(int(time.time()))
-        nonce_str = str(uuid.uuid4()).replace('-', '')
-        signature = self._sign('GET', '/v3/certificates', timestamp, nonce_str, '')
+        logger.info(f"【公钥ID模式】加载微信支付公钥: {self.pub_key_id}")
 
-        # ✅ 修复：严格格式，无多余空格
-        auth_header = (
-            f'WECHATPAY2-SHA256-RSA2048 '
-            f'mchid="{self.mchid}",'
-            f'serial_no="{merchant_serial_no}",'
-            f'nonce_str="{nonce_str}",'
-            f'timestamp="{timestamp}",'
-            f'signature="{signature}"'
-        )
+        # 公钥文件是标准PEM格式（从商户平台下载）
+        with open(WECHAT_PAY_PUBLIC_KEY_PATH, 'rb') as f:
+            public_key = serialization.load_pem_public_key(
+                f.read(),
+                backend=default_backend()
+            )
 
-        headers = {
-            'Authorization': auth_header,
-            'Accept': 'application/json',
-            'User-Agent': 'WeChatPay-Python/1.0',
-            # ✅ 修复：Wechatpay-Serial 必须是商户证书序列号
-            'Wechatpay-Serial': merchant_serial_no
-        }
+        logger.info(f"✅ 微信支付公钥加载成功: {self.pub_key_id}")
+        return public_key
 
-        # ✅ 修复：添加详细调试日志
-        logger.info(f"【下载证书】请求头完整内容: {auth_header}")
-        logger.info(f"【下载证书】签名原文: GET\n/v3/certificates\n{timestamp}\n{nonce_str}\n\n")
+    def _load_legacy_platform_cert(self) -> Any:
+        """2024年前：兼容传统平台证书文件（已废弃）"""
+        logger.warning("⚠️ 正在使用传统平台证书模式（即将废弃）")
+        cert_path = WECHAT_PAY_PUBLIC_KEY_PATH
+        if not cert_path or not os.path.exists(cert_path):
+            raise FileNotFoundError(f"平台证书文件不存在: {cert_path}")
+        with open(cert_path, 'rb') as f:
+            return serialization.load_pem_public_key(f.read(), backend=default_backend())
 
-        url = f"{self.BASE_URL}/v3/certificates"
-
-        try:
-            response = self.session.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            # ✅ 修复：打印微信返回的详细错误
-            logger.error(f"【下载证书】HTTP错误: {e}")
-            logger.error(f"【下载证书】微信响应: {response.text if response else '无响应'}")
-            raise
-
-        certs_data = response.json()
-
-        # 解密并找到匹配的证书
-        for cert_item in certs_data.get('data', []):
-            serial_no = cert_item.get('serial_no')
-            encrypt_certificate = cert_item.get('encrypt_certificate', {})
-
-            # 解密证书内容
-            key = self.apiv3_key
-            aesgcm = AESGCM(key)
-            nonce = encrypt_certificate.get('nonce', '').encode()
-            associated_data = encrypt_certificate.get('associated_data', '').encode()
-            ciphertext = base64.b64decode(encrypt_certificate.get('ciphertext', ''))
-
-            cert_pem = aesgcm.decrypt(nonce, ciphertext, associated_data).decode()
-
-            # 缓存到本地
-            cert_path = f"./certs/wechatpay_{serial_no}.pem"
-            os.makedirs('./certs', exist_ok=True)
-            with open(cert_path, 'w') as f:
-                f.write(cert_pem)
-
-            logger.info(f"平台证书已缓存: {cert_path}")
-
-            # 加载公钥
-            cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
-            public_key = cert.public_key()
-
-            # 检查是否匹配指定的公钥ID
-            if serial_no == pub_key_id.replace('PUB_KEY_', ''):
-                logger.info(f"成功加载匹配的公钥ID: {pub_key_id}")
-                return public_key
-
-        raise Exception(f"未找到匹配的公钥ID: {pub_key_id}")
-
-    # ==================== Mock数据生成 ====================
+    # ==================== Mock支持 ====================
 
     def _ensure_mock_applyment_exists(self):
-        """确保Mock模式下有测试用的进件记录"""
-        if not self.mock_mode:
-            return
-
-        if ENVIRONMENT == 'production':
-            logger.error("Mock模式在生产环境被调用，已阻止")
+        """Mock模式下创建测试数据"""
+        if not self.mock_mode or ENVIRONMENT == 'production':
             return
 
         try:
-            # 使用 get_conn() 进行数据库操作
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -305,8 +217,8 @@ class WeChatPayClient:
                 'verify_fail_reason': ''
             })
 
+        # 尝试从数据库读取真实Mock数据
         try:
-            # 使用 get_conn() 进行数据库操作
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
@@ -339,6 +251,7 @@ class WeChatPayClient:
                             logger.warning(f"Mock解密失败，使用默认数据: {e}")
         except Exception as e:
             logger.warning(f"Mock读取数据库失败: {e}")
+
         return base_data
 
     def _get_mock_application_status(self, application_no: str) -> Dict[str, Any]:
@@ -381,7 +294,7 @@ class WeChatPayClient:
                 'verify_finish_time': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S+08:00')
             }
 
-    # ==================== 证书加载 ====================
+    # ==================== 商户证书加载 ====================
 
     def _load_private_key(self):
         """加载商户私钥（PEM格式）"""
@@ -408,7 +321,6 @@ class WeChatPayClient:
             return self._cached_serial_no
 
         try:
-            # ✅ 修复：使用 x509.load_pem_x509_certificate 而不是 serialization
             with open(self.cert_path, 'rb') as f:
                 cert = x509.load_pem_x509_certificate(
                     f.read(),
@@ -478,7 +390,7 @@ class WeChatPayClient:
         signature = self._sign(method, url, timestamp, nonce_str, body)
         serial_no = self._get_merchant_serial_no()
 
-        # ✅ 关键修复：参数值中的双引号需要转义，且格式严格对齐
+        # 参数值中的双引号需要转义，且格式严格对齐
         auth_params = [
             f'mchid="{self.mchid}"',
             f'serial_no="{serial_no}"',
@@ -576,7 +488,7 @@ class WeChatPayClient:
             # 如果公钥未加载，尝试重新获取
             if not self.wechat_public_key:
                 logger.warning("平台公钥未加载，尝试重新获取...")
-                self.wechat_public_key = self._load_wechat_public_key()
+                self.wechat_public_key = self._load_wechat_public_key_from_file()
 
             message = f"{timestamp}\n{nonce}\n{body}\n"
             signature_bytes = base64.b64decode(signature)
