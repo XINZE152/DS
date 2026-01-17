@@ -12,6 +12,7 @@ from core.table_access import build_dynamic_select, _quote_identifier
 from services.user_service import hash_pwd, UserStatus, _generate_code
 
 
+
 class WechatService:
     """微信登录服务"""
 
@@ -176,3 +177,49 @@ class WechatService:
         }
         token = jwt.encode(payload, "your_secret_key", algorithm="HS256")
         return token
+
+    @staticmethod
+    def generate_wxacode(scene: str, page: str = "pages/index/index") -> Optional[bytes]:
+        """
+        调用微信接口生成小程序码
+        :param scene: 场景值（推荐码）
+        :param page: 小程序页面路径
+        :return: 图片二进制数据或 None
+        """
+        try:
+            # 获取 access_token
+            token_url = (
+                f"https://api.weixin.qq.com/cgi-bin/token?"
+                f"grant_type=client_credential&appid={WECHAT_APP_ID}&secret={WECHAT_APP_SECRET}"
+            )
+            resp = requests.get(token_url, timeout=10).json()
+
+            access_token = resp.get("access_token")
+            if not access_token:
+                logger.error(f"获取 access_token 失败: {resp}")
+                return None
+
+            # 调用微信生成小程序码接口
+            qr_url = f"https://api.weixin.qq.com/wxa/getwxacodeunlimit?access_token={access_token}"
+
+            data = {
+                "scene": scene,
+                "page": page,
+                "width": 280,
+                "is_hyaline": True,  # 透明背景
+                "check_path": False  # 不校验页面路径（适用于未发布页面）
+            }
+
+            resp = requests.post(qr_url, json=data, timeout=10)
+
+            # 微信返回的是图片字节流或 JSON 错误信息
+            content_type = resp.headers.get("Content-Type", "")
+            if "image" in content_type:
+                return resp.content
+            else:
+                logger.error(f"生成小程序码失败: {resp.text}")
+                return None
+
+        except Exception as e:
+            logger.exception(f"生成小程序码异常: {e}")
+            return None
