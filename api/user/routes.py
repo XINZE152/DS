@@ -7,7 +7,8 @@ from models.schemas.user import (
     FreezeReq, ResetPwdReq, AdminResetPwdReq, SetLevelReq, AddressReq,
     UpdateAddressReq,
     PointsReq, UserInfoResp, BindReferrerReq,MobileResp,Query,AvatarUploadResp,
-    UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq
+    UnilevelStatusResponse, UnilevelPromoteResponse,UserAllPointsResponse,UserPointsSummaryResponse,SetUnilevelReq,
+    ReferralQRResponse
 )
 
 from core.database import get_conn
@@ -1636,3 +1637,38 @@ def set_unilevel(body: SetUnilevelReq):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"操作失败: {str(e)}")
 
+@router.get("/user/referral-qr", response_model=ReferralQRResponse, summary="推荐二维码获取")
+def get_referral_qr(user_id: int):
+    """
+    获取用户的推荐码小程序码
+    - 如果已生成直接返回URL
+    - 如果未生成则调用微信接口生成
+    - 需要配置 WECHAT_APP_ID 和 WECHAT_APP_SECRET
+    """
+    try:
+        qr_url = UserService.get_referral_qr_url(user_id)
+        if not qr_url:
+            raise HTTPException(status_code=500, detail="生成二维码失败")
+
+        return ReferralQRResponse(qr_url=qr_url, message="获取成功")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"获取推荐码二维码失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器内部错误")
+
+
+@router.post("/user/refresh-referral-qr", response_model=ReferralQRResponse, summary="刷新推荐二维码")
+def refresh_referral_qr(user_id: int):
+    """
+    强制刷新用户的推荐码小程序码（重新生成）
+    """
+    try:
+        qr_url = UserService.generate_referral_qr(user_id)
+        if not qr_url:
+            raise HTTPException(status_code=500, detail="生成二维码失败")
+
+        return ReferralQRResponse(qr_url=qr_url, message="刷新成功")
+    except Exception as e:
+        logger.exception(f"刷新推荐码二维码失败: {e}")
+        raise HTTPException(status_code=500, detail="服务器内部错误")

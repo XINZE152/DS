@@ -91,6 +91,7 @@ class DatabaseManager:
                     wechat_sub_mchid VARCHAR(32) NULL DEFAULT NULL COMMENT '微信特约商户号',
                     openid VARCHAR(128) NULL DEFAULT NULL COMMENT '微信小程序openid',
                     token VARCHAR(256) NULL COMMENT '认证token（支持UUID/JWT/微信Token）',
+                    qr_path VARCHAR(255) DEFAULT NULL COMMENT '推荐码二维码路径',
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_mobile (mobile),

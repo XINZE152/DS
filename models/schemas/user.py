@@ -269,3 +269,12 @@ class SetUnilevelReq(BaseModel):
     user_id: int = Field(..., gt=0, description="用户ID")
     level: int = Field(..., ge=0, le=3, description="联创等级：0=无, 1=一星, 2=二星, 3=三星")
     admin_key: str = Field(..., description="后台口令")
+
+
+class ReferralQRResponse(BaseModel):
+    """推荐码二维码响应模型"""
+    qr_url: Optional[str] = None
+    message: str = "success"
+
+    class Config:
+        from_attributes = True  # 兼容 ORM 模式

@@ -16,6 +16,7 @@ from pathlib import Path
 from PIL import Image
 import json
 
+
 logger = get_logger(__name__)
 
 # ========== 用户状态枚举 ==========
@@ -1092,3 +1093,123 @@ class UserService:
                     "changed": True,
                     "message": "联创星级已更新"
                 }
+
+    @staticmethod
+    def get_user_referral_code(user_id: int) -> Optional[str]:
+        """
+        获取用户的推荐码，如果不存在则生成一个
+        :param user_id: 用户ID
+        :return: 推荐码或 None
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 先查询是否已有推荐码
+                cur.execute(
+                    "SELECT referral_code FROM users WHERE id = %s",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+
+                if row and row["referral_code"]:
+                    return row["referral_code"]
+
+                # 没有推荐码，生成并更新
+                new_code = _generate_code()
+
+                # 确保推荐码唯一
+                while True:
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE referral_code = %s LIMIT 1",
+                        (new_code,)
+                    )
+                    if not cur.fetchone():
+                        break
+                    new_code = _generate_code()
+
+                # 更新用户表
+                cur.execute(
+                    "UPDATE users SET referral_code = %s WHERE id = %s",
+                    (new_code, user_id)
+                )
+                conn.commit()
+
+                logger.info(f"为用户 {user_id} 生成推荐码: {new_code}")
+                return new_code
+
+    @staticmethod
+    def generate_referral_qr(user_id: int) -> Optional[str]:
+        """
+        生成用户的推荐码小程序码图片并返回访问URL
+        :param user_id: 用户ID
+        :return: 二维码图片URL路径或 None
+        """
+        try:
+            # 1. 获取推荐码
+            referral_code = UserService.get_user_referral_code(user_id)
+            if not referral_code:
+                logger.warning(f"用户 {user_id} 无法获取推荐码")
+                return None
+
+            # 2. 生成小程序码
+            qr_data = WechatService.generate_wxacode(referral_code)
+            if not qr_data:
+                logger.error(f"用户 {user_id} 生成小程序码失败")
+                return None
+
+            # 3. 保存图片
+            qr_dir = AVATAR_UPLOAD_DIR / "referral_qr"
+            qr_dir.mkdir(parents=True, exist_ok=True)
+
+            filename = f"qr_{user_id}_{referral_code}.jpg"
+            save_path = qr_dir / filename
+
+            # 如果文件已存在，先删除
+            if save_path.exists():
+                save_path.unlink()
+
+            # 保存图片
+            with open(save_path, "wb") as f:
+                f.write(qr_data)
+
+            # 4. 更新用户表的 qr_path 字段（如果字段存在）
+            qr_url = f"/pic/avatars/referral_qr/{filename}"
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # 检查字段是否存在
+                    cur.execute("SHOW COLUMNS FROM users LIKE 'qr_path'")
+                    if cur.fetchone():
+                        cur.execute(
+                            "UPDATE users SET qr_path = %s, updated_at = NOW() WHERE id = %s",
+                            (qr_url, user_id)
+                        )
+                        conn.commit()
+
+            logger.info(f"用户 {user_id} 推荐码二维码生成成功: {qr_url}")
+            return qr_url
+
+        except Exception as e:
+            logger.exception(f"生成推荐码二维码异常: {e}")
+            return None
+
+    @staticmethod
+    def get_referral_qr_url(user_id: int) -> Optional[str]:
+        """
+        获取用户已有的推荐码二维码URL，如果不存在则生成
+        :param user_id: 用户ID
+        :return: 二维码图片URL或 None
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 查询已有的二维码路径
+                cur.execute(
+                    "SELECT qr_path FROM users WHERE id = %s",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+
+                if row and row["qr_path"]:
+                    # 检查文件是否存在
+                    return row["qr_path"]
+
+        # 不存在，生成新的
+        return UserService.generate_referral_qr(user_id)
