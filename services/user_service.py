@@ -15,7 +15,6 @@ from typing import List
 from pathlib import Path
 from PIL import Image
 import json
-from .wechat_service import WechatService
 
 
 logger = get_logger(__name__)
@@ -1145,6 +1144,9 @@ class UserService:
         :return: 二维码图片URL路径或 None
         """
         try:
+            # 延迟导入，避免循环依赖
+            from .wechat_service import WechatService
+
             # 1. 获取推荐码
             referral_code = UserService.get_user_referral_code(user_id)
             if not referral_code:
