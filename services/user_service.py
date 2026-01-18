@@ -15,6 +15,7 @@ from typing import List
 from pathlib import Path
 from PIL import Image
 import json
+from .wechat_service import WechatService
 
 
 logger = get_logger(__name__)
