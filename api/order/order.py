@@ -1,7 +1,8 @@
 from services.finance_service import FinanceService
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, cast
+from core.config import Settings, settings
 from core.database import get_conn
 from services.finance_service import split_order_funds
 from core.config import VALID_PAY_WAYS, POINTS_DISCOUNT_RATE
@@ -309,8 +310,8 @@ class OrderManager:
                 # 4. 用户信息（方案一：兜底手机号）
                 user_info = {
                     "id": order_info.get("user_id"),
-                    "name": order_info.get("user_name"),
-                    "mobile": order_info.get("user_mobile")      # 只取 users.mobile
+                    "name": order_info.get("consignee_name"),
+                    "mobile": order_info.get("consignee_phone")      # 只取 users.mobile
                 }
 
                 # （推荐）清理 order_info 中的用户字段，避免语义混乱
@@ -434,7 +435,7 @@ class OrderCreate(BaseModel):
 class OrderPay(BaseModel):
     order_number: str
     pay_way: str
-    coupon_id: Optional[int] = None  # 新增：使用的优惠券ID（如果有）
+    coupon_id: Optional[int] = None
     points_to_use: Optional[Decimal] = Decimal('0')
 
 
@@ -442,6 +443,14 @@ class StatusUpdate(BaseModel):
     order_number: str
     new_status: str
     reason: Optional[str] = None
+
+class WechatPayParams(BaseModel):
+    appId: str
+    timeStamp: str
+    nonceStr: str
+    package: str
+    signType: str
+    paySign: str
 
 
 # ---------------- 路由 ----------------
@@ -492,7 +501,7 @@ def order_pay(body: OrderPay):
             total_points_to_use = Decimal('0')
             coupon_amount = Decimal('0')
 
-            # 3.1 处理积分抵扣
+            # 3.1 处理积分抵扣（只校验，不扣）
             if body.points_to_use and body.points_to_use > 0:
                 cur.execute(
                     "SELECT COALESCE(member_points, 0) as points FROM users WHERE id = %s",
@@ -501,13 +510,12 @@ def order_pay(body: OrderPay):
                 user = cur.fetchone()
                 if not user or Decimal(str(user['points'])) < body.points_to_use:
                     raise HTTPException(status_code=400, detail="积分余额不足")
-
                 total_points_to_use = body.points_to_use
                 logger.debug(f"用户{user_id}使用积分{total_points_to_use}分")
 
-            # 3.2 处理优惠券抵扣（增强验证）
+            # 3.2 处理优惠券抵扣（只校验，不标记已用）
             if body.coupon_id:
-                # 查询优惠券详情（包含适用范围和有效期）
+                today = datetime.now().date()
                 cur.execute(
                     """SELECT c.id, c.amount, c.applicable_product_type, c.valid_from, c.valid_to 
                        FROM coupons c 
@@ -517,57 +525,59 @@ def order_pay(body: OrderPay):
                 coupon = cur.fetchone()
                 if not coupon:
                     raise HTTPException(status_code=400, detail="优惠券不存在或已使用")
-
-                # 验证有效期
-                today = datetime.now().date()
                 if not (coupon['valid_from'] <= today <= coupon['valid_to']):
                     raise HTTPException(status_code=400, detail="优惠券不在有效期内")
 
-                # 验证商品类型匹配：查询订单中的商品类型
-                cur.execute("""
-                    SELECT DISTINCT p.is_member_product 
-                    FROM order_items oi 
-                    JOIN products p ON oi.product_id = p.id 
-                    WHERE oi.order_id = %s
-                """, (order_id,))
-                order_product_types = cur.fetchall()
-
-                has_member_product = any(p['is_member_product'] for p in order_product_types)
-                has_normal_product = any(not p['is_member_product'] for p in order_product_types)
-
-                # 验证优惠券适用范围
-                applicable_type = coupon['applicable_product_type']
-                if applicable_type == 'normal_only' and has_member_product:
+                cur.execute(
+                    """SELECT DISTINCT p.is_member_product 
+                       FROM order_items oi JOIN products p ON oi.product_id=p.id 
+                       WHERE oi.order_id=%s""",
+                    (order_id,)
+                )
+                prod_types = [r["is_member_product"] for r in cur.fetchall()]
+                has_member = any(prod_types)
+                app_type = coupon["applicable_product_type"]
+                if app_type == "normal_only" and has_member:
                     raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
-                if applicable_type == 'member_only' and not has_member_product:
+                if app_type == "member_only" and not has_member:
                     raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
 
-                # 验证通过，标记优惠券为已使用
-                cur.execute(
-                    "UPDATE coupons SET status = 'used', used_at = NOW() WHERE id = %s",
-                    (body.coupon_id,)
-                )
+                coupon_amount = Decimal(str(coupon["amount"]))
+                logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}, 类型:{app_type}")
 
-                coupon_amount = Decimal(str(coupon['amount']))
-                logger.debug(f"用户{user_id}使用优惠券#{body.coupon_id}: 金额¥{coupon_amount}, 类型:{applicable_type}")
-
-            # 4. 财务结算（传入分离的参数）
-            fs = FinanceService()
-            fs.settle_order(
-                order_no=body.order_number,
-                user_id=order_info["user_id"],
-                order_id=order_id,
-                points_to_use=total_points_to_use,  # 仅积分
-                coupon_discount=coupon_amount,  # 仅优惠券
-                external_conn=conn
+            # 4. 把“待抵扣”数据暂存到订单（不扣减/不标记已用）
+            cur.execute(
+                "UPDATE orders SET pending_points=%s, pending_coupon_id=%s WHERE id=%s",
+                (int(total_points_to_use), body.coupon_id, order_id)
             )
 
-            # 5. 更新订单状态
-            next_status = "pending_recv" if order_info["delivery_way"] == "pickup" else "pending_ship"
-            ok = OrderManager.update_status(body.order_number, next_status, external_conn=conn)
-            if not ok:
-                raise HTTPException(status_code=500, detail="订单状态更新失败")
+            # 5. 计算微信应收现金（分）
+            cash_fee = int((Decimal(order_info["total_amount"]) * 100) \
+                           - int(total_points_to_use) * 100 \
+                           - coupon_amount * 100)
+            cash_fee = max(cash_fee, 1)   # 防 0 分
 
+            # 6. 调微信统一下单（Mock 模式直接返回空）
+            if settings.WX_MOCK_MODE:
+                logger.info(f"[MOCK] 微信 unified-order 成功，订单{body.order_number}")
+            else:
+                import services.notify_service as ns
+                req = {
+                    "appid": settings.WECHAT_APP_ID,
+                    "mchid": settings.WECHAT_PAY_MCH_ID,
+                    "description": f"订单{body.order_number}",
+                    "out_trade_no": body.order_number,
+                    "notify_url": settings.WECHAT_NOTIFY_URL,
+                    "amount": {"total": cash_fee, "currency": "CNY"}
+                }
+                try:
+                    loop = __import__("asyncio").get_event_loop()
+                    loop.run_until_complete(ns.wxpay.async_unified_order(req))
+                except Exception as e:
+                    logger.error(f"微信下单失败: {e}")
+                    raise HTTPException(status_code=502, detail="生成支付单失败")
+
+            # 7. 原样返回成功（前端收到后自行调起微信 SDK）
             conn.commit()
 
     return {"ok": True}
