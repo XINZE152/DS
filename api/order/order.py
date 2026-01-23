@@ -715,7 +715,11 @@ def order_pay(body: OrderPay):
                     # 在 AnyIO 的线程池中可能没有当前事件循环，使用 asyncio.run 在独立循环中执行协程
                     asyncio.run(ns.async_unified_order(req))
                 except Exception as e:
-                    logger.error(f"微信下单失败: {e}")
+                    msg = str(e)
+                    logger.error(f"微信下单失败: {msg}")
+                    if '参数与首次请求时不一致' in msg or 'INVALID_REQUEST' in msg:
+                        # WeChat 对同一 out_trade_no 的重复请求要求参数一致，若不一致会返回该错误
+                        raise HTTPException(status_code=409, detail="微信已存在相同订单号且参数与首次请求不一致，请使用新的订单号重试或联系客服处理")
                     raise HTTPException(status_code=502, detail="生成支付单失败")
 
             # 7. 原样返回成功（前端收到后自行调起微信 SDK）
