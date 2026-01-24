@@ -624,6 +624,33 @@ class WeChatPayClient:
             nonce = resource.get("nonce", "")
             associated_data = resource.get("associated_data", "")
 
+            # 记录密文/随机串长度与前后片段，便于排查是否被截断或改写
+            try:
+                def _preview(val: str) -> str:
+                    if not isinstance(val, str):
+                        return str(type(val))
+                    if len(val) <= 80:
+                        return val
+                    return f"{val[:30]}...{val[-30:]}"
+
+                logger.info(
+                    "解密前检查: ct_len=%s, nonce_len=%s, ad_len=%s, ct_preview=%s",
+                    len(cipher_text) if isinstance(cipher_text, str) else None,
+                    len(nonce) if isinstance(nonce, str) else None,
+                    len(associated_data) if isinstance(associated_data, str) else None,
+                    _preview(cipher_text),
+                )
+            except Exception:
+                logger.debug("记录解密前检查失败", exc_info=True)
+
+            # 若收到非微信格式的测试回调（无密文或 nonce 长度异常），直接记录并返回空，避免报错刷屏
+            if not cipher_text or not nonce:
+                logger.warning("回调 resource 缺少 ciphertext/nonce，跳过解密")
+                return {}
+            if not (8 <= len(nonce) <= 128):
+                logger.warning("回调 nonce 长度异常(%s)，跳过解密", len(nonce))
+                return {}
+
             key = self.apiv3_key
             if not key:
                 raise Exception("API v3 key 未配置")
@@ -648,7 +675,17 @@ class WeChatPayClient:
             )
             return json.loads(decrypted.decode('utf-8'))
         except Exception as e:
-            logger.error(f"解密失败: {str(e)}")
+            try:
+                logger.error(
+                    "解密失败: %s; ct_len=%s; nonce_len=%s; ad_len=%s; ct_preview=%s",
+                    str(e),
+                    len(cipher_text) if isinstance(cipher_text, str) else None,
+                    len(nonce) if isinstance(nonce, str) else None,
+                    len(associated_data) if isinstance(associated_data, str) else None,
+                    cipher_text[:30] + "..." + cipher_text[-30:] if isinstance(cipher_text, str) and len(cipher_text) > 80 else cipher_text,
+                )
+            except Exception:
+                logger.error(f"解密失败且记录日志时异常: {str(e)}")
             # 解密失败时不尝试将 ciphertext 当作 JSON 解析返回（会导致二次解析错误）
             # 返回空字典，调用方应对缺失字段做校验并返回合适的错误响应
             return {}

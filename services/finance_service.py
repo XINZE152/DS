@@ -647,6 +647,7 @@ class FinanceService:
         # ===================================================
 
         total_distributed = Decimal('0')
+        referral_paid = False  # 防止推荐奖励和团队奖励同时触发
 
         # 1. 推荐奖励（首次购买 + 推荐人必须是星级会员）
         if old_level == 0:  # 只有0星升1星时才发推荐奖励
@@ -695,24 +696,32 @@ class FinanceService:
 
                     logger.info(f"推荐奖励发放: 用户{referrer['referrer_id']}({referrer_level}星) +{reward_amount:.2f}")
                     total_distributed += reward_amount
+                    referral_paid = True
                 else:
                     logger.debug(f"推荐人{referrer['referrer_id']}不是星级会员({referrer_level}星)，不发放推荐奖励")
             else:
                 logger.debug("购买者无推荐人，跳过推荐奖励")
 
-        # 2. 团队奖励（只为新达到的层级发放）
-        if new_level <= max(old_level, 1):
-            logger.debug("等级未提升或保持1星，不产生团队奖励")
+        # 2. 团队奖励（只为新达到的层级发放；0→1 也发放），且不与推荐奖励同发
+        if referral_paid:
+            logger.debug("已发放推荐奖励，本次跳过团队奖励")
+            return
+
+        # 继续判断是否提升等级
+        # 2. 团队奖励（只为新达到的层级发放；0→1 也发放）
+        if new_level <= old_level:
+            logger.debug("等级未提升，不产生团队奖励")
             return
 
         # ==================== 计算新达到的层级范围 ====================
-        start_layer = max(old_level + 1, 2)
+        start_layer = max(old_level + 1, 1)  # 允许 0→1 发放 L1 团队奖励
         logger.debug(f"发放团队奖励层级范围: L{start_layer}-L{new_level}")
         # ========================================================================
 
         # ==================== 核心修复：构建完整推荐链 ============================
         current_id = buyer_id
         referrer_chain = []  # 存储完整的推荐链
+        visited = {buyer_id}  # 防止自指或循环
 
         for current_layer in range(1, MAX_TEAM_LAYER + 1):
             cur.execute(
@@ -726,6 +735,12 @@ class FinanceService:
                 break
 
             referrer_id = ref['referrer_id']
+
+            # 避免自指或循环导致自己拿团队奖
+            if referrer_id in visited:
+                logger.debug(f"推荐链出现自指/循环（用户{referrer_id}），停止发放团队奖励")
+                break
+            visited.add(referrer_id)
             cur.execute("SELECT member_level FROM users WHERE id = %s", (referrer_id,))
             user_row = cur.fetchone()
             referrer_level = user_row.get('member_level', 0) if user_row else 0
@@ -762,6 +777,9 @@ class FinanceService:
                 if candidate['layer'] < target_layer:
                     continue  # L2奖励不能由L1用户获得
                 # ====================================================================
+
+                if candidate['user_id'] == buyer_id:
+                    continue  # 仅本人一人时不发团队奖励给自己
 
                 if candidate['member_level'] >= target_layer:
                     # 找到第一个满足条件的用户（按层数从小到大）

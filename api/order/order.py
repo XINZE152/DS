@@ -236,15 +236,9 @@ class OrderManager:
 
     @staticmethod
     def list_by_user(user_id: int, status: Optional[str] = None):
-        """
-        返回订单列表，每条订单带：
-        - 订单主信息
-        - 第一条商品明细（含规格）
-        - 规格取自 orders.refund_reason（JSON 字符串）
-        """
+        """按用户查询订单列表，附带首件商品和规格字段。"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. 主订单
                 select_fields = OrderManager._build_orders_select(cur)
                 sql = f"SELECT {select_fields} FROM orders WHERE user_id = %s"
                 params = [user_id]
@@ -255,171 +249,81 @@ class OrderManager:
                 cur.execute(sql, tuple(params))
                 orders = cur.fetchall()
 
-                # 2. 补齐第一条商品 + 规格
                 for o in orders:
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT oi.*, p.name
                         FROM order_items oi
                         JOIN products p ON oi.product_id = p.id
                         WHERE oi.order_id = %s
                         LIMIT 1
-                    """, (o["id"],))
+                        """,
+                        (o["id"],)
+                    )
                     first_item = cur.fetchone()
                     o["first_product"] = first_item
-                    # 规格 JSON 原样透出
                     o["specifications"] = o.get("refund_reason")
 
                 return orders
 
     @staticmethod
     def detail(order_number: str) -> Optional[dict]:
+        """查询单个订单详情（含用户、地址、商品明细）。"""
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. 构造 orders 表字段（全部带 o. 前缀，避免歧义）
-                structure = get_table_structure(cur, "orders")
-                select_parts = []
-                for field in structure["fields"]:
-                    if field in structure["asset_fields"]:
-                        select_parts.append(
-                            f"COALESCE(o.{_quote_identifier(field)}, 0) AS {_quote_identifier(field)}"
-                        )
-                    else:
-                        select_parts.append(f"o.{_quote_identifier(field)}")
-
-                select_fields = ", ".join(select_parts)
-
-                # 2. 查询订单 + 用户
-                cur.execute(f"""
-                    SELECT 
-                        {select_fields},
-                        u.id     AS user_id,
-                        u.name   AS user_name,
-                        u.mobile AS user_mobile
-                    FROM orders o
-                    JOIN users u ON o.user_id = u.id
-                    WHERE o.order_number = %s
-                """, (order_number,))
-                order_info = cur.fetchone()
-
-                if not order_info:
+                select_fields = OrderManager._build_orders_select(cur)
+                cur.execute(
+                    f"SELECT {select_fields} FROM orders WHERE order_number=%s LIMIT 1",
+                    (order_number,)
+                )
+                order = cur.fetchone()
+                if not order:
                     return None
 
-                # 3. 商品明细
-                cur.execute("""
-                    SELECT oi.*, p.name
+                order_id = order.get("id")
+                user_id = order.get("user_id")
+
+                # 商品明细
+                cur.execute(
+                    """
+                    SELECT oi.*, p.name AS product_name, p.is_member_product, p.cover AS product_cover
                     FROM order_items oi
-                    JOIN products p ON oi.product_id = p.id
+                    LEFT JOIN products p ON oi.product_id = p.id
                     WHERE oi.order_id = %s
-                """, (order_info["id"],))
+                    """,
+                    (order_id,)
+                )
                 items = cur.fetchall()
 
-                # 4. 用户信息（方案一：兜底手机号）
-                user_info = {
-                    "id": order_info.get("user_id"),
-                    "name": order_info.get("consignee_name"),
-                    "mobile": order_info.get("consignee_phone")      # 只取 users.mobile
+                # 用户信息
+                user_info = None
+                if user_id:
+                    cur.execute(
+                        "SELECT id, name, mobile, avatar, member_level, member_points FROM users WHERE id=%s",
+                        (user_id,)
+                    )
+                    user_info = cur.fetchone()
+
+                # 地址信息直接取订单中的收货字段
+                address = {
+                    "consignee_name": order.get("consignee_name"),
+                    "consignee_phone": order.get("consignee_phone"),
+                    "province": order.get("province"),
+                    "city": order.get("city"),
+                    "district": order.get("district"),
+                    "detail": order.get("shipping_address"),
                 }
 
-                # （推荐）清理 order_info 中的用户字段，避免语义混乱
-                for k in ["user_id", "user_name", "user_mobile"]:
-                    order_info.pop(k, None)
-
-                # 如果还有类似 "u.user_id" 这种异常 key，也一并清掉
-                for k in list(order_info.keys()):
-                    if "." in k:
-                        order_info.pop(k, None)
-
-                # 5. 地址信息（你原来的，保持不变）
-                address = {
-                    "consignee_name": order_info.get("consignee_name"),
-                    "consignee_phone": order_info.get("consignee_phone"),
-                    "province": order_info.get("province"),
-                    "city": order_info.get("city"),
-                    "district": order_info.get("district"),
-                    "detail": order_info.get("shipping_address")
-                } if any(order_info.get(k) for k in (
-                    "consignee_name",
-                    "consignee_phone",
-                    "province",
-                    "city",
-                    "district",
-                    "shipping_address"
-                )) else None
-
-                # 6. 最终返回
                 return {
-                    "order_info": order_info,
+                    "order_info": order,
                     "user": user_info,
                     "address": address,
                     "items": items,
-                    "specifications": order_info.get("refund_reason")
+                    "specifications": order.get("refund_reason"),
                 }
 
-    @staticmethod
-    def update_status(order_number: str, new_status: str, reason: Optional[str] = None, external_conn=None) -> bool:
-        # 先读取订单当前状态与id
-        order_id = None
-        old_status = None
 
-        if external_conn:
-            cur = external_conn.cursor()
-            try:
-                cur.execute("SELECT id, status FROM orders WHERE order_number = %s", (order_number,))
-                res = cur.fetchone()
-                if not res:
-                    return False
-                order_id = res['id']
-                old_status = res['status']
 
-                # 如果状态已经是目标状态，则视为成功（幂等）
-                if old_status == new_status:
-                    return True
-
-                cur.execute(
-                    "UPDATE orders SET status = %s, refund_reason = %s, updated_at = NOW() WHERE id = %s",
-                    (new_status, reason, order_id)
-                )
-                if cur.rowcount == 0:
-                    return False
-            finally:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
-        else:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id, status FROM orders WHERE order_number = %s", (order_number,))
-                    res = cur.fetchone()
-                    if not res:
-                        return False
-                    order_id = res['id']
-                    old_status = res['status']
-
-                    if old_status == new_status:
-                        return True
-
-                    cur.execute(
-                        "UPDATE orders SET status = %s, refund_reason = %s, updated_at = NOW() WHERE id = %s",
-                        (new_status, reason, order_id)
-                    )
-                    if cur.rowcount == 0:
-                        return False
-                    # 确保在使用内部连接时提交更改
-                    try:
-                        conn.commit()
-                    except Exception:
-                        pass
-
-        # ✅ **移除**：积分已在支付时发放，确认收货后不再发放
-        # if old_status == 'pending_recv' and new_status == 'completed':
-        #     try:
-        #         fs = FinanceService()
-        #         fs.grant_points_on_receive(order_number, external_conn=external_conn)
-        #     except Exception as e:
-        #         logger.error(f"订单{order_number}确认收货后积分发放失败: {e}", exc_info=True)
-
-        return True
 
     @staticmethod
     def export_to_excel(order_numbers: List[str]) -> bytes:
@@ -599,125 +503,6 @@ def create_order(body: OrderCreate):
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")
     return {"order_number": no}
 
-@router.post("/pay", summary="订单支付")
-def order_pay(body: OrderPay):
-    """
-    前端确认付款后调用，仅做校验与暂存，不重复创建微信订单。
-    真正的扣积分、核销券、资金拆分、更新订单状态由 /wechat-pay/notify 完成。
-    """
-    if body.pay_way not in VALID_PAY_WAYS:
-        raise HTTPException(status_code=422, detail="非法支付方式")
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # 1. 取订单基本信息
-            cur.execute(
-                "SELECT id,user_id,total_amount,status,is_vip_item "
-                "FROM orders WHERE order_number=%s",
-                (body.order_number,)
-            )
-            order_info = cur.fetchone()
-            if not order_info:
-                raise HTTPException(status_code=404, detail="订单不存在")
-            if order_info["status"] != "pending_pay":
-                raise HTTPException(status_code=400, detail="订单状态不是待付款")
-
-            order_id = order_info["id"]
-            user_id  = order_info["user_id"]
-
-            # 2. 校验积分
-            total_points_to_use = Decimal('0')
-            if body.points_to_use and body.points_to_use > 0:
-                cur.execute(
-                    "SELECT COALESCE(member_points,0) AS points FROM users WHERE id=%s",
-                    (user_id,)
-                )
-                user = cur.fetchone()
-                if not user or Decimal(str(user['points'])) < body.points_to_use:
-                    raise HTTPException(status_code=400, detail="积分余额不足")
-                total_points_to_use = body.points_to_use
-
-            # 3. 校验优惠券
-            coupon_amount = Decimal('0')
-            if body.coupon_id:
-                today = datetime.now().date()
-                cur.execute(
-                    """SELECT c.id,c.amount,c.applicable_product_type,c.valid_from,c.valid_to
-                       FROM coupons c
-                       WHERE c.id=%s AND c.user_id=%s AND c.status='unused'""",
-                    (body.coupon_id, user_id)
-                )
-                coupon = cur.fetchone()
-                if not coupon:
-                    raise HTTPException(status_code=400, detail="优惠券不存在或已使用")
-                if not (coupon['valid_from'] <= today <= coupon['valid_to']):
-                    raise HTTPException(status_code=400, detail="优惠券不在有效期内")
-
-                # 校验适用商品类型
-                cur.execute(
-                    """SELECT DISTINCT p.is_member_product
-                       FROM order_items oi JOIN products p ON oi.product_id=p.id
-                       WHERE oi.order_id=%s""",
-                    (order_id,)
-                )
-                has_member = any(r["is_member_product"] for r in cur.fetchall())
-                app_type = coupon["applicable_product_type"]
-                if app_type == "normal_only" and has_member:
-                    raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
-                if app_type == "member_only" and not has_member:
-                    raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
-
-                coupon_amount = Decimal(str(coupon["amount"]))
-
-            # 4. 暂存待抵扣信息（真正的扣积分/核销券/资金拆分改由 notify 完成）
-            cur.execute(
-                "UPDATE orders SET pending_points=%s, pending_coupon_id=%s WHERE id=%s",
-                (int(total_points_to_use), body.coupon_id, order_id)
-            )
-
-            # 5. 跳过微信统一下单，仅记录日志
-            if settings.WX_MOCK_MODE:
-                logger.info(
-                    f"[MOCK] 订单{body.order_number}微信支付单已由 /wechat-pay/create-order 创建，"
-                    f"/order/pay 不再重复调用微信接口"
-                )
-            else:
-                import services.notify_service as ns
-                req = {
-                    "appid": settings.WECHAT_APP_ID,
-                    "mchid": settings.WECHAT_PAY_MCH_ID,
-                    "description": f"订单{body.order_number}",
-                    "out_trade_no": body.order_number,
-                    "notify_url": settings.WECHAT_PAY_NOTIFY_URL,
-                    "amount": {"total": cash_fee, "currency": "CNY"}
-                }
-                # 获取用户 openid（优先从 users 表读取），若无则提示前端传入或绑定
-                cur.execute("SELECT openid FROM users WHERE id=%s", (user_id,))
-                user_row = cur.fetchone()
-                openid = (user_row.get('openid') if user_row else None) or ''
-                if not openid:
-                    logger.error(f"下单失败：用户 {user_id} 未绑定 openid，无法创建 JSAPI 支付单")
-                    raise HTTPException(status_code=422, detail="缺少 openid：请在小程序端传入或在用户资料中绑定 openid")
-
-                # 将 payer.openid 填入请求，供 async_unified_order 使用
-                req["payer"] = {"openid": openid}
-                try:
-                    import asyncio
-                    # 在 AnyIO 的线程池中可能没有当前事件循环，使用 asyncio.run 在独立循环中执行协程
-                    asyncio.run(ns.async_unified_order(req))
-                except Exception as e:
-                    msg = str(e)
-                    logger.error(f"微信下单失败: {msg}")
-                    if '参数与首次请求时不一致' in msg or 'INVALID_REQUEST' in msg:
-                        # WeChat 对同一 out_trade_no 的重复请求要求参数一致，若不一致会返回该错误
-                        raise HTTPException(status_code=409, detail="微信已存在相同订单号且参数与首次请求不一致，请使用新的订单号重试或联系客服处理")
-                    raise HTTPException(status_code=502, detail="生成支付单失败")
-
-            # 7. 原样返回成功（前端收到后自行调起微信 SDK）
-            conn.commit()
-
-    # 6. 直接返回成功（前端已拿到 WechatPayParams，这里只做校验+暂存）
-    return {"ok": True}
 
 @router.get("/{user_id}", summary="查询用户订单列表")
 def list_orders(user_id: int, status: Optional[str] = None):
@@ -795,9 +580,9 @@ def export_orders(body: OrderExportRequest):
     if not body.order_numbers:
         raise HTTPException(status_code=422, detail="订单号列表不能为空")
 
-    # 限制一次最多导出100个订单
-    if len(body.order_numbers) > 100:
-        raise HTTPException(status_code=422, detail="单次导出订单数不能超过100个")
+    # 限制一次最多导出1000个订单
+    if len(body.order_numbers) > 1000:
+        raise HTTPException(status_code=422, detail="单次导出订单数不能超过1000个")
 
     try:
         excel_data = OrderManager.export_to_excel(body.order_numbers)
