@@ -322,24 +322,40 @@ class OrderManager:
                     "specifications": order.get("refund_reason"),
                 }
 
-
-
-
     @staticmethod
     def export_to_excel(order_numbers: List[str]) -> bytes:
         """
-        将多个订单详情导出为Excel文件
-        :param order_numbers: 订单号列表
-        :return: Excel文件的二进制数据
+        导出订单详情（包含资金拆分明细）
+        生成两个工作表：订单详情、资金拆分明细
         """
-        # 创建工作簿
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "订单详情"
+        # 账户类型中英文映射
+        account_type_map = {
+            "merchant_balance": "商家余额",
+            "public_welfare": "公益基金",
+            "maintain_pool": "平台维护",
+            "subsidy_pool": "周补贴池",
+            "director_pool": "荣誉董事分红",
+            "shop_pool": "社区店",
+            "city_pool": "城市运营中心",
+            "branch_pool": "大区分公司",
+            "fund_pool": "事业发展基金",
+            "company_points": "公司积分账户",
+            "company_balance": "公司余额账户",
+            "platform_revenue_pool": "平台收入池（会员商品）",
+            "wx_applyment_fee": "微信进件手续费",
+            "income": "收入",
+            "expense": "支出"
+        }
 
-        # 定义表头（中文名称）
-        headers = [
-            "订单号", "订单状态", "订单金额", "支付方式", "配送方式",
+        wb = Workbook()
+
+        # ========== 第一个工作表：订单详情 ==========
+        ws1 = wb.active
+        ws1.title = "订单详情"
+
+        headers1 = [
+            "订单号", "订单状态", "总金额", "原始金额", "积分抵扣", "实付金额",
+            "支付方式", "配送方式", "是否会员订单",
             "用户ID", "用户姓名", "用户手机号",
             "收货人", "收货电话", "省份", "城市", "区县", "详细地址",
             "商品信息", "商品规格", "下单时间", "支付时间", "发货时间"
@@ -350,100 +366,158 @@ class OrderManager:
         header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
         header_alignment = Alignment(horizontal="center", vertical="center")
         thin_border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
         )
 
-        # 写入表头
-        for col_idx, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_idx, value=header)
+        for col_idx, header in enumerate(headers1, 1):
+            cell = ws1.cell(row=1, column=col_idx, value=header)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = header_alignment
             cell.border = thin_border
 
-        # 数据行
-        row_idx = 2
-        for order_number in order_numbers:
-            order_data = OrderManager.detail(order_number)
-            if not order_data:
-                continue
+        # ========== 第二个工作表：资金拆分明细 ==========
+        ws2 = wb.create_sheet(title="资金拆分")
+        headers2 = [
+            "订单号", "账户类型", "变动金额", "变动后余额",
+            "流水类型", "备注", "创建时间"
+        ]
 
-            order_info = order_data["order_info"]
-            user_info = order_data["user"]
-            address = order_data["address"] or {}
-            items = order_data["items"]
-            specifications = order_data.get("specifications") or {}
+        for col_idx, header in enumerate(headers2, 1):
+            cell = ws2.cell(row=1, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
 
-            # 处理商品信息（多个商品用换行符分隔）
-            product_names = "\n".join([item.get("product_name", "") for item in items])
-            quantities = "\n".join([f"数量: {item.get('quantity', 0)}" for item in items])
-            unit_prices = "\n".join([f"单价: ¥{item.get('unit_price', 0)}" for item in items])
-            product_info = f"{product_names}\n{quantities}\n{unit_prices}"
+        # 查询数据并填充
+        row_idx1 = 2
+        row_idx2 = 2
 
-            # 处理规格信息
-            spec_str = ""
-            if isinstance(specifications, dict):
-                spec_str = "\n".join([f"{k}: {v}" for k, v in specifications.items()])
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                for order_number in order_numbers:
+                    # 1. 查询订单详情
+                    order_data = OrderManager.detail(order_number)
+                    if not order_data:
+                        continue
 
-            # 整理行数据
-            row_data = [
-                order_info.get("order_number", ""),
-                order_info.get("status", ""),
-                float(order_info.get("total_amount", 0)),
-                order_info.get("pay_way", "wechat"),
-                order_info.get("delivery_way", "platform"),
-                user_info.get("id", ""),
-                user_info.get("name", ""),
-                user_info.get("mobile", ""),
-                address.get("consignee_name", ""),
-                address.get("consignee_phone", ""),
-                address.get("province", ""),
-                address.get("city", ""),
-                address.get("district", ""),
-                address.get("detail", ""),
-                product_info,
-                spec_str,
-                order_info.get("created_at", ""),
-                order_info.get("paid_at", ""),
-                order_info.get("shipped_at", "")
-            ]
+                    order_info = order_data["order_info"]
+                    user_info = order_data["user"]
+                    address = order_data["address"] or {}
+                    items = order_data["items"]
+                    specifications = order_data.get("specifications") or {}
 
-            # 写入数据行
-            for col_idx, value in enumerate(row_data, 1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=value)
-                cell.alignment = Alignment(vertical="center", wrap_text=True)
-                cell.border = thin_border
+                    # 计算实付金额
+                    total = Decimal(str(order_info.get("total_amount", 0)))
+                    points_discount = Decimal(str(order_info.get("points_discount", 0)))
+                    actual_pay = total - points_discount
 
-                # 金额列设置为货币格式
-                if col_idx == 3 and isinstance(value, (int, float)):
-                    cell.number_format = '¥#,##0.00'
+                    # 商品信息拼接
+                    product_info = "\n".join([
+                        f"{item.get('product_name', '')} x{item.get('quantity', 0)} @¥{item.get('unit_price', 0)}"
+                        for item in items
+                    ])
 
-            row_idx += 1
+                    # 规格信息
+                    spec_str = ""
+                    if isinstance(specifications, dict):
+                        spec_str = "\n".join([f"{k}: {v}" for k, v in specifications.items()])
 
-        # 调整列宽（自动适应内容）
-        for column in ws.columns:
+                    # 填充订单详情行
+                    row_data1 = [
+                        order_info.get("order_number", ""),
+                        order_info.get("status", ""),
+                        float(total),
+                        float(order_info.get("original_amount", 0)),
+                        float(points_discount),
+                        float(actual_pay),
+                        order_info.get("pay_way", "wechat"),
+                        order_info.get("delivery_way", "platform"),
+                        "是" if order_info.get("is_member_order") else "否",
+                        user_info.get("id", ""),
+                        user_info.get("name", ""),
+                        user_info.get("mobile", ""),
+                        address.get("consignee_name", ""),
+                        address.get("consignee_phone", ""),
+                        address.get("province", ""),
+                        address.get("city", ""),
+                        address.get("district", ""),
+                        address.get("detail", ""),
+                        product_info,
+                        spec_str,
+                        order_info.get("created_at", ""),
+                        order_info.get("paid_at", ""),
+                        order_info.get("shipped_at", "")
+                    ]
+
+                    for col_idx, value in enumerate(row_data1, 1):
+                        cell = ws1.cell(row=row_idx1, column=col_idx, value=value)
+                        cell.alignment = Alignment(vertical="center", wrap_text=True)
+                        cell.border = thin_border
+                        if col_idx in [3, 4, 5, 6]:  # 金额列
+                            cell.number_format = '¥#,##0.00'
+
+                    row_idx1 += 1
+
+                    # 2. 查询资金拆分明细（account_flow表）
+                    cur.execute("""
+                        SELECT account_type, change_amount, balance_after, 
+                               flow_type, remark, created_at
+                        FROM account_flow 
+                        WHERE remark LIKE %s
+                        ORDER BY created_at ASC
+                    """, (f"%{order_number}%",))
+
+                    flows = cur.fetchall()
+                    for flow in flows:
+                        # 转换账户类型为中文
+                        account_type_en = flow.get("account_type", "")
+                        account_type_cn = account_type_map.get(account_type_en, account_type_en)
+
+                        row_data2 = [
+                            order_number,
+                            account_type_cn,  # 使用中文
+                            float(flow.get("change_amount", 0)),
+                            float(flow.get("balance_after", 0)),
+                            flow.get("flow_type", ""),
+                            flow.get("remark", ""),
+                            flow.get("created_at", "")
+                        ]
+
+                        for col_idx, value in enumerate(row_data2, 1):
+                            cell = ws2.cell(row=row_idx2, column=col_idx, value=value)
+                            cell.alignment = Alignment(vertical="center")
+                            cell.border = thin_border
+                            if col_idx in [3, 4]:  # 金额列
+                                cell.number_format = '¥#,##0.00'
+
+                        row_idx2 += 1
+
+        # 调整列宽（订单详情表）
+        for column in ws1.columns:
             max_length = 0
             column_letter = get_column_letter(column[0].column)
             for cell in column:
                 try:
-                    if len(str(cell.value)) > max_length:
+                    if cell.value and len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
                 except:
                     pass
-            adjusted_width = min(max_length + 2, 50)  # 最大宽度限制为50
-            ws.column_dimensions[column_letter].width = adjusted_width
+            ws1.column_dimensions[column_letter].width = min(max_length + 2, 50)
 
-        # 调整行高（适应多行内容）
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            max_lines = 1
-            for cell in row:
-                if cell.value and isinstance(cell.value, str):
-                    lines = cell.value.count('\n') + 1
-                    max_lines = max(max_lines, lines)
-            ws.row_dimensions[row[0].row].height = min(15 * max_lines, 100)  # 最大高度限制为100
+        # 调整列宽（资金拆分表）
+        for column in ws2.columns:
+            max_length = 0
+            column_letter = get_column_letter(column[0].column)
+            for cell in column:
+                try:
+                    if cell.value and len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            ws2.column_dimensions[column_letter].width = min(max_length + 2, 50)
 
         # 保存到内存
         excel_data = BytesIO()
@@ -570,6 +644,11 @@ def auto_receive_task(db_cfg: dict = None):
 class OrderExportRequest(BaseModel):
     order_numbers: List[str]
 
+class OrderExportByTimeRequest(BaseModel):
+    start_time: str  # 格式：2025-01-01 00:00:00
+    end_time: str    # 格式：2025-01-31 23:59:59
+    status: Optional[str] = None  # 可选：按订单状态筛选（如 pending_ship, completed 等）
+
 
 @router.post("/export", summary="导出订单详情到Excel")
 def export_orders(body: OrderExportRequest):
@@ -593,6 +672,97 @@ def export_orders(body: OrderExportRequest):
         )
     except Exception as e:
         logger.error(f"导出订单失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
+
+
+@router.post("/export/by-time", summary="按时间范围导出订单")
+def export_orders_by_time(body: OrderExportByTimeRequest):
+    """
+    按时间范围批量导出订单详情
+    请求示例: {
+        "start_time": "2025-01-01 00:00:00",
+        "end_time": "2025-01-31 23:59:59",
+        "status": "completed"  // 可选，不填则导出所有状态
+    }
+    """
+    # 1. 时间格式校验
+    try:
+        start = datetime.strptime(body.start_time, "%Y-%m-%d %H:%M:%S")
+        end = datetime.strptime(body.end_time, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="时间格式错误，请使用：YYYY-MM-DD HH:MM:SS"
+        )
+
+    if end < start:
+        raise HTTPException(
+            status_code=422,
+            detail="结束时间不能早于开始时间"
+        )
+
+    # 2. 限制时间范围（防止导出数据量过大，最多31天）
+    if (end - start).days > 31:
+        raise HTTPException(
+            status_code=422,
+            detail="时间范围不能超过31天"
+        )
+
+    # 3. 查询时间范围内的订单号
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if body.status:
+                # 按状态筛选
+                sql = """
+                    SELECT order_number 
+                    FROM orders 
+                    WHERE created_at >= %s 
+                      AND created_at <= %s 
+                      AND status = %s 
+                    ORDER BY created_at DESC 
+                    LIMIT 500
+                """
+                cur.execute(sql, (body.start_time, body.end_time, body.status))
+            else:
+                # 不筛选状态，导出全部
+                sql = """
+                    SELECT order_number 
+                    FROM orders 
+                    WHERE created_at >= %s 
+                      AND created_at <= %s 
+                    ORDER BY created_at DESC 
+                    LIMIT 500
+                """
+                cur.execute(sql, (body.start_time, body.end_time))
+
+            rows = cur.fetchall()
+            order_numbers = [row["order_number"] for row in rows]
+
+    # 4. 检查是否有数据
+    if not order_numbers:
+        raise HTTPException(
+            status_code=404,
+            detail="该时间段内没有符合条件的订单"
+        )
+
+    # 5. 调用现有的导出方法生成Excel
+    try:
+        excel_data = OrderManager.export_to_excel(order_numbers)
+
+        # 生成带时间范围的文件名
+        start_str = body.start_time[:10].replace("-", "")
+        end_str = body.end_time[:10].replace("-", "")
+        filename = f"orders_{start_str}_to_{end_str}.xlsx"
+        if body.status:
+            filename = f"orders_{body.status}_{start_str}_to_{end_str}.xlsx"
+
+        return StreamingResponse(
+            BytesIO(excel_data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        logger.error(f"按时间导出订单失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
 # 模块被导入时自动启动守护线程
