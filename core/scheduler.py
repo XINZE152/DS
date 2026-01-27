@@ -41,8 +41,68 @@ class TaskScheduler:
             replace_existing=True
         )
 
+        # ==================== 新增：每周六零点自动发放周补贴 ====================
+        self.scheduler.add_job(
+            self.auto_distribute_weekly_subsidy,
+            CronTrigger(day_of_week=5, hour=0, minute=0),  # 每周六 00:00:00 (0=周一, 5=周六, 6=周日)
+            id="weekly_subsidy_auto",
+            replace_existing=True,
+            misfire_grace_time=3600  # 容错1小时
+        )
+
+        # ==================== 新增：每月1日零点自动发放联创分红 ====================
+        self.scheduler.add_job(
+            self.auto_distribute_unilevel_dividend,
+            CronTrigger(day=1, hour=0, minute=0),  # 每月1号 00:00:00
+            id="monthly_unilevel_auto",
+            replace_existing=True,
+            misfire_grace_time=3600
+        )
+
         self.scheduler.start()
         logger.info("定时任务管理器已启动")
+
+    # ==================== 新增方法：执行周补贴发放 ====================
+    def auto_distribute_weekly_subsidy(self):
+        """每周六零点自动发放周补贴"""
+        try:
+            from services.finance_service import FinanceService
+
+            logger.info("=" * 50)
+            logger.info("[定时任务] 开始执行周补贴自动发放")
+            logger.info(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            service = FinanceService()
+            success = service.distribute_weekly_subsidy()
+
+            if success:
+                logger.info("[定时任务] 周补贴发放成功完成")
+            else:
+                logger.warning("[定时任务] 周补贴发放失败，可能余额不足或无可发放用户")
+
+        except Exception as e:
+            logger.error(f"[定时任务] 周补贴发放异常: {str(e)}", exc_info=True)
+
+    # ==================== 新增方法：执行联创分红发放 ====================
+    def auto_distribute_unilevel_dividend(self):
+        """每月1日零点自动发放联创分红"""
+        try:
+            from services.finance_service import FinanceService
+
+            logger.info("=" * 50)
+            logger.info("[定时任务] 开始执行联创分红自动发放")
+            logger.info(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            service = FinanceService()
+            result = service.distribute_unilevel_dividend()
+
+            if result:
+                logger.info("[定时任务] 联创分红发放成功完成")
+            else:
+                logger.warning("[定时任务] 联创分红发放失败，可能余额不足或无符合条件的联创用户")
+
+        except Exception as e:
+            logger.error(f"[定时任务] 联创分红发放异常: {str(e)}", exc_info=True)
 
     def shutdown(self):
         """关闭定时任务"""
