@@ -4481,7 +4481,7 @@ class FinanceService:
 
                 if adjusted_points_value is not None:
                     # 使用手动调整的积分值
-                    points_value = adjusted_points_value
+                    points_value = adjusted_points_value['value']
                     is_manual_adjusted = True
                     logger.info(f"预览使用手动调整的积分值: {points_value:.4f}")
                 else:
