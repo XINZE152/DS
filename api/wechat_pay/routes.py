@@ -31,13 +31,21 @@ async def create_jsapi_order(request: Request):
         raise HTTPException(status_code=400, detail="invalid JSON payload")
 
     out_trade_no = payload.get('out_trade_no') or payload.get('order_id')
-    total_fee_client = payload.get('total_fee')  # 分
+    total_fee_client = payload.get('total_fee')  # 分（客户端传入，可能已扣除优惠券/积分）
     openid = payload.get('openid')
     description = payload.get('description', '商品支付')
     coupon_id = payload.get('coupon_id')
 
     if not out_trade_no or not total_fee_client or not openid:
         raise HTTPException(status_code=400, detail="missing out_trade_no/total_fee/openid")
+
+    # 统一转为 int，确保单位为分
+    try:
+        total_fee_client_int = int(total_fee_client)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid total_fee")
+    if total_fee_client_int <= 0:
+        raise HTTPException(status_code=400, detail="invalid total_fee")
 
     try:
         # 幂等校验：确保订单存在且处于待支付状态
@@ -104,11 +112,18 @@ async def create_jsapi_order(request: Request):
                 if payable_cents <= 0:
                     raise HTTPException(status_code=400, detail="invalid payable amount")
 
-                if int(total_fee_client) != payable_cents:
+                if total_fee_client_int != payable_cents:
                     logger.warning(
                         "订单支付金额校正: client=%s, server=%s, order=%s",
                         total_fee_client, payable_cents, out_trade_no
                     )
+                    # 若客户端传入金额更低，视为已应用优惠券/积分后的最终应付，优先采用客户端金额
+                    if 0 < total_fee_client_int < payable_cents:
+                        logger.info(
+                            "使用客户端金额作为应付金额: client=%s, server=%s, order=%s",
+                            total_fee_client_int, payable_cents, out_trade_no
+                        )
+                        payable_cents = total_fee_client_int
                 total_fee = payable_cents
             
         # 到这里无需持有连接，调用微信接口
