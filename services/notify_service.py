@@ -204,7 +204,8 @@ async def _handle_offline_pay_notify(order_no: str, wx_total: int, data: dict) -
                     return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
 
                 # 3. 金额核对
-                db_total = int(Decimal(order["paid_amount"]) * 100) if order["paid_amount"] else int(Decimal(order["amount"]) * 100)
+                db_total = int(Decimal(order["paid_amount"]) * 100) if order["paid_amount"] is not None else int(
+                    Decimal(order["amount"]) * 100)
                 
                 if wx_total != db_total:
                     logger.error(f"[offline-pay] 金额不一致: 微信{wx_total}≠系统{db_total}")
@@ -282,9 +283,10 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
     try:
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 查询订单信息，包含 original_amount
                 cur.execute(
                     "SELECT id,user_id,total_amount,status,delivery_way,"
-                    "pending_points,pending_coupon_id "
+                    "pending_points,pending_coupon_id,original_amount "
                     "FROM orders WHERE order_number=%s FOR UPDATE",
                     (order_no,)
                 )
@@ -298,12 +300,42 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
                 db_total = int(Decimal(order["total_amount"]) * 100)
                 db_total -= int(order["pending_points"] or 0) * 100
                 coupon_amt = Decimal('0')
+
+                # ====== 关键修复：增加优惠券状态校验 ======
                 if order["pending_coupon_id"]:
-                    cur.execute("SELECT amount FROM coupons WHERE id=%s", (order["pending_coupon_id"],))
-                    row = cur.fetchone()
-                    if row:
-                        coupon_amt = Decimal(str(row["amount"]))
+                    # 使用 FOR UPDATE 锁定优惠券记录，防止并发
+                    cur.execute(
+                        """SELECT amount, status, valid_to, user_id 
+                           FROM coupons 
+                           WHERE id = %s 
+                           AND status = 'unused' 
+                           AND valid_to >= CURDATE()
+                           FOR UPDATE""",
+                        (order["pending_coupon_id"],)
+                    )
+                    coupon_row = cur.fetchone()
+
+                    if not coupon_row:
+                        # 优惠券无效（已使用、过期或不存在）
+                        logger.error(f"[online-pay] 订单 {order_no} 优惠券校验失败: ID={order['pending_coupon_id']}")
+                        raise ValueError(f"优惠券无效或已失效: {order['pending_coupon_id']}")
+
+                    # 验证优惠券所属用户
+                    if coupon_row['user_id'] != order['user_id']:
+                        logger.error(
+                            f"[online-pay] 订单 {order_no} 优惠券用户不匹配: 券用户={coupon_row['user_id']}, 订单用户={order['user_id']}")
+                        raise ValueError("优惠券不属于当前订单用户")
+
+                    coupon_amt = Decimal(str(coupon_row["amount"]))
                     db_total -= int(coupon_amt * 100)
+
+                    # 现在可以安全地标记为已使用
+                    cur.execute(
+                        "UPDATE coupons SET status='used',used_at=NOW() WHERE id=%s",
+                        (order["pending_coupon_id"],)
+                    )
+                    logger.info(
+                        f"[online-pay] 订单 {order_no} 优惠券核销成功: ID={order['pending_coupon_id']}, 金额={coupon_amt}")
 
                 if wx_total != db_total:
                     raise ValueError(f"金额不一致 微信{wx_total}≠系统{db_total}")
@@ -314,13 +346,18 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
                         "UPDATE users SET member_points=member_points-%s WHERE id=%s",
                         (order["pending_points"], order["user_id"])
                     )
-                
-                # 5. 真正标记优惠券已使用
-                if order["pending_coupon_id"]:
-                    cur.execute(
-                        "UPDATE coupons SET status='used',used_at=NOW() WHERE id=%s",
-                        (order["pending_coupon_id"],)
-                    )
+
+                # 记录优惠券和积分抵扣金额到订单表（关键修复）
+                cur.execute("""
+                    UPDATE orders 
+                    SET coupon_discount = %s,
+                        original_amount = COALESCE(%s, total_amount)
+                    WHERE id = %s
+                """, (
+                    coupon_amt,
+                    order["original_amount"] or order["total_amount"],
+                    order["id"]
+                ))
 
                 # 6. 资金结算（写流水）
                 from services.finance_service import FinanceService
@@ -340,14 +377,13 @@ async def _handle_online_pay_notify(order_no: str, wx_total: int, data: dict) ->
                 OrderManager.update_status(order_no, next_status, external_conn=conn)
 
                 conn.commit()
-        
+
         logger.info(f"[online-pay] 线上订单支付成功: {order_no}")
         return "<xml><return_code><![CDATA[SUCCESS]]></return_code></xml>"
-        
+
     except Exception as e:
         logger.error(f"[online-pay] 处理失败: {e}", exc_info=True)
         return "<xml><return_code><![CDATA[FAIL]]></return_code></xml>"
-
 
 # 兼容调用：异步统一下单包装（服务内其他模块可能调用 ns.wxpay.async_unified_order）
 async def async_unified_order(req: dict) -> dict:

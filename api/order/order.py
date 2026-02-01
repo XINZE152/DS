@@ -255,7 +255,9 @@ class OrderManager:
             specifications: Optional[str] = None,
             buy_now: bool = False,
             buy_now_items: Optional[List[Dict[str, Any]]] = None,
-            delivery_way: str = "platform"
+            delivery_way: str = "platform",
+            points_to_use: Optional[Decimal] = None,
+            coupon_id: Optional[int] = None
     ) -> Optional[str]:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -309,7 +311,41 @@ class OrderManager:
                     if not items:
                         return None
 
-                # ---------- 2. 地址信息 ----------
+                # ---------- 2. 优惠券商品类型验证（新增） ----------
+                has_vip = any(i["is_vip"] for i in items)
+
+                if coupon_id:
+                    # 查询优惠券详情并锁定
+                    cur.execute("""
+                        SELECT id, amount, applicable_product_type, status, valid_from, valid_to, user_id
+                        FROM coupons 
+                        WHERE id = %s AND user_id = %s AND status = 'unused'
+                        FOR UPDATE
+                    """, (coupon_id, user_id))
+                    coupon = cur.fetchone()
+
+                    if not coupon:
+                        raise HTTPException(status_code=400, detail="优惠券不存在、已被使用或不属于当前用户")
+
+                    # 检查有效期
+                    today = datetime.now().date()
+                    if not (coupon['valid_from'] <= today <= coupon['valid_to']):
+                        raise HTTPException(status_code=400, detail="优惠券不在有效期内")
+
+                    # 检查商品类型匹配
+                    applicable_type = coupon['applicable_product_type']
+                    if applicable_type == 'member_only' and not has_vip:
+                        raise HTTPException(status_code=400, detail="该优惠券仅限会员商品使用")
+                    if applicable_type == 'normal_only' and has_vip:
+                        raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
+
+                    # 检查优惠券金额是否超过订单金额
+                    coupon_amount = Decimal(str(coupon['amount']))
+                    total_amount = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
+                    if coupon_amount > total_amount:
+                        raise HTTPException(status_code=400, detail="优惠券金额不能大于订单金额")
+
+                # ---------- 3. 地址信息 ----------
                 if delivery_way == "pickup":
                     consignee_name = consignee_phone = province = city = district = shipping_address = ""
                 elif custom_addr:
@@ -322,32 +358,35 @@ class OrderManager:
                 else:
                     raise HTTPException(status_code=422, detail="必须上传收货地址或选择自提")
 
-                # ---------- 3. 订单主表 ----------
+                # ---------- 4. 订单主表 ----------
                 total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
-                has_vip = any(i["is_vip"] for i in items)
                 order_number = datetime.now().strftime("%Y%m%d%H%M%S") + str(user_id) + str(uuid.uuid4().int)[:6]
-                init_status = "pending_pay"  # 统一待支付
+                init_status = "pending_pay"
 
+                # 修改后的 INSERT 语句，包含 original_amount, pending_points, pending_coupon_id
                 cur.execute("""
                     INSERT INTO orders(
-                        user_id, order_number, total_amount, status, is_vip_item,
+                        user_id, order_number, total_amount, original_amount, status, is_vip_item,
                         consignee_name, consignee_phone,
                         province, city, district, shipping_address, delivery_way,
-                        pay_way, auto_recv_time, refund_reason, expire_at)
-                    VALUES (%s, %s, %s, %s, %s,
+                        pay_way, auto_recv_time, refund_reason, expire_at,
+                        pending_points, pending_coupon_id)
+                    VALUES (%s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s, %s,
-                            'wechat', %s, %s, %s)
+                            'wechat', %s, %s, %s, %s, %s)
                 """, (
-                    user_id, order_number, total, init_status, has_vip,
+                    user_id, order_number, total, total, init_status, has_vip,
                     consignee_name, consignee_phone,
                     province, city, district, shipping_address, delivery_way,
                     datetime.now() + timedelta(days=7),
                     specifications,
-                    datetime.now() + timedelta(hours=12) if init_status == "pending_pay" else None
+                    datetime.now() + timedelta(hours=12) if init_status == "pending_pay" else None,
+                    points_to_use or Decimal('0'),
+                    coupon_id
                 ))
                 oid = cur.lastrowid
 
-                # ---------- 4. 库存校验 & 扣减 ----------
+                # ---------- 5. 库存校验 & 扣减 ----------
                 structure = get_table_structure(cur, "product_skus")
                 has_stock_field = 'stock' in structure['fields']
                 stock_select = (
@@ -364,7 +403,7 @@ class OrderManager:
                     if current_stock < i["quantity"]:
                         raise HTTPException(status_code=400, detail=f"SKU {i['sku_id']} 库存不足")
 
-                # ---------- 5. 写订单明细 ----------
+                # ---------- 6. 写订单明细 ----------
                 for i in items:
                     cur.execute("""
                         INSERT INTO order_items(order_id, product_id, sku_id, quantity, unit_price, total_price)
@@ -374,18 +413,15 @@ class OrderManager:
                         i["price"], Decimal(str(i["quantity"])) * Decimal(str(i["price"]))
                     ))
 
-                # ---------- 6. 扣库存 ----------
+                # ---------- 7. 扣库存 ----------
                 if has_stock_field:
                     for i in items:
                         cur.execute("UPDATE product_skus SET stock = stock - %s WHERE id = %s",
                                     (i["quantity"], i['sku_id']))
 
-                # ---------- 7. 清空购物车（仅购物车结算场景） ----------
+                # ---------- 8. 清空购物车（仅购物车结算场景） ----------
                 if not buy_now:
                     cur.execute("DELETE FROM cart WHERE user_id = %s AND selected = 1", (user_id,))
-
-                # ---------- 8. 资金拆分 ----------
-                # 下单时不再拆分资金，改在支付成功后进行，避免资金池余额被预扣
 
                 conn.commit()
                 return order_number
@@ -922,6 +958,8 @@ class OrderCreate(BaseModel):
     specifications: Optional[str] = None
     buy_now: bool = False
     buy_now_items: Optional[List[Dict[str, Any]]] = None
+    points_to_use: Optional[Decimal] = Decimal('0')  # 新增：积分抵扣数量
+    coupon_id: Optional[int] = None                   # 新增：优惠券ID
 
 
 class OrderPay(BaseModel):
@@ -960,10 +998,12 @@ def create_order(body: OrderCreate):
         body.user_id,
         body.address_id,
         body.custom_address,
-        specifications=body.specifications,  # 透传
+        specifications=body.specifications,
         buy_now=body.buy_now,
         buy_now_items=body.buy_now_items,
-        delivery_way=body.delivery_way
+        delivery_way=body.delivery_way,
+        points_to_use=body.points_to_use,  # 传递积分参数
+        coupon_id=body.coupon_id           # 传递优惠券参数
     )
     if not no:
         raise HTTPException(status_code=422, detail="购物车为空或地址缺失")

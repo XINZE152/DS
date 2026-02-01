@@ -170,6 +170,9 @@ class DatabaseManager:
                     wechat_shipping_msg VARCHAR(500) NULL COMMENT '微信发货接口返回错误信息',
                     wechat_last_sync_time DATETIME NULL COMMENT '最后一次同步微信状态时间',
                     wechat_shipping_retry_count TINYINT NOT NULL DEFAULT 0 COMMENT '微信发货重试次数，最多1次',
+                    pending_points DECIMAL(12,4) DEFAULT NULL,           -- 确保有这行（或让自动添加机制处理）
+                    pending_coupon_id BIGINT UNSIGNED DEFAULT NULL,      -- 确保有这行（或让自动添加机制处理）
+                    coupon_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000, -- 确保有这行
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user (user_id),
@@ -772,6 +775,11 @@ class DatabaseManager:
                 'wechat_shipping_msg': 'wechat_shipping_msg VARCHAR(500) NULL COMMENT \'微信发货接口返回错误信息\'',
                 'wechat_last_sync_time': 'wechat_last_sync_time DATETIME NULL COMMENT \'最后一次同步微信状态时间\'',
                 'wechat_shipping_retry_count': 'wechat_shipping_retry_count TINYINT NOT NULL DEFAULT 0 COMMENT \'微信发货重试次数，最多1次\'',
+                # 新增字段：积分和优惠券相关
+                'pending_points': 'pending_points DECIMAL(12,4) DEFAULT NULL COMMENT \'下单时选择的积分抵扣数量（支付前临时存储）\'',
+                'pending_coupon_id': 'pending_coupon_id BIGINT UNSIGNED DEFAULT NULL COMMENT \'下单时选择的优惠券ID（支付前临时存储）\'',
+                'coupon_discount': 'coupon_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'优惠券抵扣金额（支付后写入）\'',
+                'original_amount': 'original_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT \'订单原始金额（优惠前）\'',
             },
             'order_items': {
                 'sku_id': 'sku_id BIGINT UNSIGNED NULL',
