@@ -81,10 +81,13 @@ WECHAT_APP_SECRET=WECHAT_APP_SECRET
 		```
 
 保留说明
-启动后，访问 http://127.0.0.1:<port>/docs 查看 API 文档（port 为环境变量 `UVICORN_PORT`，若未设置则默认使用 `8000`）。
 
-或者访问 http://127.0.0.1:<port>/redoc 查看 ReDoc 文档（port 同上）。
+- 启动后，访问 `http://127.0.0.1:<port>/docs` 查看 API 文档
+- 或访问 `http://127.0.0.1:<port>/redoc` 查看 ReDoc 文档
 
+> [!NOTE]
+>
+> `<port>` 为环境变量 `UVICORN_PORT`，若未设置则默认使用 `8000`
 ---
 
 ## AI 辅助免责声明
