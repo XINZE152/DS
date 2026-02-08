@@ -142,6 +142,7 @@ class WechatApplymentService:
 
     async def submit_applyment(self, user_id: int, data: dict) -> dict:
         """提交进件申请到微信支付"""
+        payload_snapshot: dict = {}
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 获取最新的草稿或申请记录
@@ -200,16 +201,76 @@ class WechatApplymentService:
                     )
                     raise HTTPException(status_code=400, detail="请填写超级管理员姓名（contact_name）后再提交")
 
+                # 预先构建快照，避免异常分支未定义
+                payload_snapshot = {
+                    "applyment_db_id": applyment.get("id"),
+                    "business_code": applyment.get("business_code"),
+                    "subject_type": applyment.get("subject_type"),
+                    "has_contact_info": bool(applyment.get("contact_info")),
+                    "has_subject_info": bool(applyment.get("subject_info")),
+                    "has_bank_account_info": bool(applyment.get("bank_account_info")),
+                    "business_info": data.get("business_info") or applyment.get("business_info"),
+                }
+
                 # 调用微信支付API提交进件
                 try:
-                    payload_snapshot = {
-                        "applyment_db_id": applyment.get("id"),
-                        "business_code": applyment.get("business_code"),
-                        "subject_type": applyment.get("subject_type"),
-                        "has_contact_info": bool(applyment.get("contact_info")),
-                        "has_subject_info": bool(applyment.get("subject_info")),
-                        "has_bank_account_info": bool(applyment.get("bank_account_info")),
-                    }
+                    # 前端提交的 business_info 透传给微信；如未提供则回退草稿中的字段
+                    business_info_raw = data.get("business_info") or applyment.get("business_info") or {}
+                    if isinstance(business_info_raw, str):
+                        try:
+                            business_info_raw = json.loads(business_info_raw)
+                        except Exception:
+                            business_info_raw = {}
+
+                    # 从已上传材料回填身份证件 media_id
+                    cur.execute(
+                        """
+                            SELECT media_type, media_id
+                            FROM wx_applyment_media
+                            WHERE applyment_id = %s AND media_type IN ('id_card_front', 'id_card_back')
+                        """,
+                        (applyment["id"],),
+                    )
+                    media_rows = cur.fetchall() or []
+                    id_card_media = {row["media_type"]: row["media_id"] for row in media_rows}
+
+                    subject_info_raw = applyment.get("subject_info")
+                    subject_info = (
+                        json.loads(subject_info_raw)
+                        if isinstance(subject_info_raw, str)
+                        else subject_info_raw
+                        or {}
+                    )
+                    identity_info = subject_info.get("identity_info") or {}
+                    if isinstance(identity_info, str):
+                        try:
+                            identity_info = json.loads(identity_info)
+                        except Exception:
+                            identity_info = {}
+
+                    id_card_info = identity_info.get("id_card_info") or {}
+                    if id_card_media.get("id_card_front"):
+                        id_card_info["id_card_copy"] = id_card_media["id_card_front"]
+                    if id_card_media.get("id_card_back"):
+                        id_card_info["id_card_national"] = id_card_media["id_card_back"]
+
+                    if id_card_info:
+                        identity_info["id_card_info"] = id_card_info
+                        subject_info["identity_info"] = identity_info
+                        applyment["subject_info"] = subject_info
+
+                    # 如果仍缺失简称，尝试从主体信息 name/business_name 填充
+                    if not business_info_raw.get("merchant_shortname"):
+                        subject_info_raw = applyment.get("subject_info")
+                        subject_info = json.loads(subject_info_raw) if isinstance(subject_info_raw, str) else subject_info_raw or {}
+                        fallback_shortname = subject_info.get("merchant_shortname") or subject_info.get("name") or subject_info.get("business_name")
+                        if fallback_shortname:
+                            business_info_raw["merchant_shortname"] = fallback_shortname
+
+                    if not business_info_raw.get("merchant_shortname"):
+                        raise HTTPException(status_code=400, detail="请填写商户简称（merchant_shortname）后再提交")
+
+                    applyment["business_info"] = business_info_raw
                     response = self.pay_client.submit_applyment(applyment)
                     applyment_id = response.get("applyment_id")
 
