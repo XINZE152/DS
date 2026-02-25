@@ -225,7 +225,6 @@ class OfflineService:
             if wxpay:
                 pay_params = wxpay.get_jsapi_params(prepay_id=prepay_id, timestamp=timestamp, nonce_str=nonce_str)
             else:
-                # Mock 模式下的降级
                 pay_params = {
                     "appId": settings.WECHAT_APP_ID,
                     "timeStamp": timestamp,
@@ -234,7 +233,10 @@ class OfflineService:
                     "signType": "RSA",
                     "paySign": "mock_sign",
                 }
-            
+
+            # ✅ 关键修复：加上 total_fee（前端或封装层需要）
+            pay_params["total_fee"] = str(final_amount)  # 转为字符串
+
             return {
                 "pay_params": pay_params,
                 "original_amount": original_amount,
