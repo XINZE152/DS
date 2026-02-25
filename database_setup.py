@@ -1374,12 +1374,10 @@ class DatabaseManager:
             ('微信进件手续费', 'wx_applyment_fee'),
         ]
 
-        # 检查是否已存在账户，如果存在则不删除重新初始化
         cursor.execute("SELECT COUNT(*) as count FROM finance_accounts")
         count = cursor.fetchone()['count']
 
         if count == 0:
-            # 只有表为空时才初始化
             for name, acc_type in accounts:
                 cursor.execute(
                     "INSERT INTO finance_accounts (account_name, account_type, balance) VALUES (%s, %s, 0)",
@@ -1397,6 +1395,25 @@ class DatabaseManager:
                 logger.info("已为 finance_accounts 添加 config_params 列")
         except Exception as e:
             logger.debug(f"⚠️ 添加 config_params 列失败（已忽略）: {e}")
+
+        # ===== 新增：确保 subsidy_pool 的 config_params 中包含日补贴比例 =====
+        try:
+            cursor.execute("SELECT config_params FROM finance_accounts WHERE account_type = 'subsidy_pool'")
+            row = cursor.fetchone()
+            import json
+            config = {}
+            if row and row.get('config_params'):
+                config = json.loads(row['config_params'])
+            if 'daily_subsidy_ratio' not in config:
+                config['daily_subsidy_ratio'] = '0.05'
+                cursor.execute(
+                    "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'subsidy_pool'",
+                    (json.dumps(config),)
+                )
+                logger.info("已为 subsidy_pool 设置默认日补贴比例: 0.05")
+        except Exception as e:
+            logger.warning(f"设置 subsidy_pool 日补贴比例失败（可手动设置）: {e}")
+        # ================================================================
 
         # 确保每个子资金池的行存在且其 config_params 中包含 allocation 字段（幂等）
         try:
@@ -1424,7 +1441,6 @@ class DatabaseManager:
                             parsed = {}
                         if not isinstance(parsed, dict):
                             parsed = {}
-                        # 如果没有 allocation 字段或 allocation 不等于默认，则更新
                         if parsed.get('allocation') != str(aval):
                             parsed['allocation'] = str(aval)
                             need_update = True
@@ -1433,9 +1449,9 @@ class DatabaseManager:
                         need_update = True
 
                     if need_update:
-                        cursor.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s", (json.dumps(parsed, ensure_ascii=False), row['id']))
+                        cursor.execute("UPDATE finance_accounts SET config_params=%s WHERE id=%s",
+                                       (json.dumps(parsed, ensure_ascii=False), row['id']))
                 else:
-                    # 插入新的账户行
                     parsed = {'allocation': str(aval)}
                     cursor.execute(
                         "INSERT INTO finance_accounts(account_name, account_type, balance, config_params) VALUES (%s,%s,%s,%s)",

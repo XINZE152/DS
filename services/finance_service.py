@@ -1123,36 +1123,80 @@ class FinanceService:
             "remark": "积分值 = 补贴池金额 ÷ 总系统积分（含用户积分100% + 商家积分100% + 平台储备100%），最高不超过0.02（2%）。如果设置了auto_clear=true，发放一次后会自动清除手动配置。"
         }
 
-    def distribute_weekly_subsidy(self) -> bool:
-        """
-        发放周补贴（修复版：商家积分按100%权重、平台积分按100%权重参与总积分计算）
+        # ==================== 日补贴比例管理 ====================
 
-        关键修复：
-        1. 总积分 = 用户积分(100%) + 商家积分(100%) + 平台储备积分(100%)
-        2. 但发放对象仅限于持有 member_points > 0 的用户
-        3. 【新增】平台积分池(company_points)按比例发放给用户26（扣除等额积分数值）
+    def get_daily_subsidy_ratio(self) -> Decimal:
+        """获取每日可发放的补贴池比例（默认0.05）"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = 'subsidy_pool'"
+                    )
+                    row = cur.fetchone()
+                    if row and row.get('config_params'):
+                        import json
+                        config = json.loads(row['config_params'])
+                        ratio = config.get('daily_subsidy_ratio', 0.05)
+                        return Decimal(str(ratio))
+        except Exception as e:
+            logger.error(f"获取日补贴比例失败: {e}")
+        return Decimal('0.05')
+
+    def set_daily_subsidy_ratio(self, ratio: float) -> bool:
+        """手动调整日补贴比例"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT config_params FROM finance_accounts WHERE account_type = 'subsidy_pool'"
+                    )
+                    row = cur.fetchone()
+                    config = {}
+                    if row and row.get('config_params'):
+                        import json
+                        config = json.loads(row['config_params'])
+                    config['daily_subsidy_ratio'] = str(ratio)
+                    cur.execute(
+                        "UPDATE finance_accounts SET config_params = %s WHERE account_type = 'subsidy_pool'",
+                        (json.dumps(config),)
+                    )
+                    conn.commit()
+                    logger.info(f"日补贴比例已调整为: {ratio}")
+                    return True
+        except Exception as e:
+            logger.error(f"设置日补贴比例失败: {e}")
+            return False
+
+    # ==================== 补贴发放 ====================
+    def distribute_daily_subsidy(self) -> bool:
         """
-        logger.info("周补贴发放开始（修复版：商家和平台积分参与运算，平台积分单发用户26）")
+        发放日补贴（每日可分配金额 = 补贴池余额 × 日补贴比例）
+        """
+        logger.info("日补贴发放开始（每日可分配金额 = 补贴池余额 × 日比例）")
 
         pool_balance = self.get_account_balance('subsidy_pool')
         if pool_balance <= 0:
             logger.warning("❌ 补贴池余额不足")
             return False
 
-        # ========== 修复：计算完整的平台总积分（包含商家和平台）==========
+        # 获取日补贴比例
+        daily_ratio = self.get_daily_subsidy_ratio()
+        daily_available = pool_balance * daily_ratio
+        if daily_available <= 0:
+            logger.warning("❌ 当日可分配金额为0")
+            return False
+
+        # ========== 计算完整的平台总积分（包含商家和平台）==========
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # 1. 消费者积分（全额计入）
                 cur.execute("SELECT SUM(COALESCE(member_points, 0)) as total FROM users")
                 total_user_points = Decimal(str(cur.fetchone()['total'] or 0))
 
-                # 2. 商家积分（全额计入，只参与运算，不发放）
                 cur.execute(
                     "SELECT SUM(COALESCE(merchant_points, 0)) as total FROM users WHERE COALESCE(merchant_points, 0) > 0")
                 total_merchant_points = Decimal(str(cur.fetchone()['total'] or 0))
-                weighted_merchant_points = total_merchant_points
 
-                # 3. 平台储备积分（公司积分池，全额计入，发放给用户26）
                 try:
                     cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
                     cp_row = cur.fetchone()
@@ -1160,8 +1204,7 @@ class FinanceService:
                 except Exception:
                     company_points_balance = Decimal('0')
 
-                # 4. 计算总积分（分母）
-                total_system_points = total_user_points + weighted_merchant_points + company_points_balance
+                total_system_points = total_user_points + total_merchant_points + company_points_balance
 
         if total_system_points <= 0:
             logger.warning("❌ 总积分为0，无法发放补贴")
@@ -1172,16 +1215,22 @@ class FinanceService:
         if adjusted_config:
             points_value = adjusted_config['value']
             auto_clear = adjusted_config.get('auto_clear', False)
+            theoretical_total = points_value * total_user_points
+            if theoretical_total > daily_available:
+                raise FinanceException(
+                    f"手动积分值 {points_value:.4f} 计算的理论总额 {theoretical_total:.4f} 超过当日可分配金额 {daily_available:.4f}，请调整日比例或手动值"
+                )
             logger.info(f"使用手动调整的积分值: {points_value:.4f}")
         else:
-            points_value = pool_balance / total_system_points
+            points_value = daily_available / total_system_points
             if points_value > MAX_POINTS_VALUE:
                 points_value = MAX_POINTS_VALUE
             auto_clear = False
-            logger.info(f"积分价值自动计算: ¥{points_value:.4f}/分")
+            logger.info(
+                f"自动计算积分值: {points_value:.4f} (可分配金额 {daily_available:.2f} / 总积分 {total_system_points})")
 
         logger.info(
-            f"补贴池: ¥{pool_balance} | 总系统积分: {total_system_points} (用户:{total_user_points} + 商家:{weighted_merchant_points} + 平台:{company_points_balance}) | 积分值: ¥{points_value:.4f}/分")
+            f"补贴池: ¥{pool_balance} | 当日可分配: ¥{daily_available:.4f} | 总系统积分: {total_system_points} | 积分值: ¥{points_value:.4f}/分")
 
         total_distributed = Decimal('0')
         total_points_deducted = Decimal('0')
@@ -1190,7 +1239,6 @@ class FinanceService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # ========== 关键：只查询有【用户积分】的消费者，商家和平台不会被查询到 ==========
                     cur.execute(
                         "SELECT id, member_points, subsidy_points FROM users WHERE COALESCE(member_points, 0) > 0"
                     )
@@ -1201,22 +1249,16 @@ class FinanceService:
                         member_points = Decimal(str(user['member_points'] or 0))
                         current_subsidy_points = Decimal(str(user['subsidy_points'] or 0))
 
-                        # 计算补贴金额 = 用户积分 × 积分价值
                         subsidy_amount = member_points * points_value
-
-                        # 发放的点数直接等于补贴金额（1元=1点数）
                         points_to_add = subsidy_amount
 
                         if points_to_add <= Decimal('0'):
                             continue
 
-                        # 只扣除与发放点数等量的积分（不再是全部积分）
                         points_to_deduct = min(points_to_add, member_points)
-
                         if points_to_deduct <= Decimal('0'):
                             continue
 
-                        # ====== 发放补贴点数 ======
                         new_subsidy_points = current_subsidy_points + points_to_add
                         cur.execute(
                             "UPDATE users SET subsidy_points = %s WHERE id = %s",
@@ -1227,189 +1269,134 @@ class FinanceService:
                             (points_to_add, user_id)
                         )
 
-                        # ====== 扣减 member_points ======
                         cur.execute(
                             "UPDATE users SET member_points = member_points - %s WHERE id = %s",
                             (points_to_deduct, user_id)
                         )
 
-                        # 获取扣减后的余额
                         cur.execute(
                             "SELECT member_points FROM users WHERE id = %s",
                             (user_id,)
                         )
                         new_balance = Decimal(str(cur.fetchone()['member_points'] or 0))
 
-                        # 写入积分扣减流水
                         cur.execute(
                             """INSERT INTO points_log 
                                (user_id, change_amount, balance_after, type, reason, related_order, created_at)
                                VALUES (%s, %s, %s, 'member', %s, NULL, NOW())""",
-                            (user_id, -points_to_deduct, new_balance, f"周补贴扣减积分（本次积分值:{points_value:.4f}）")
+                            (user_id, -points_to_deduct, new_balance, f"日补贴扣减积分（本次积分值:{points_value:.4f}）")
                         )
-                        # ====== 将扣除的积分转入公司积分池(已删除) ======
-                        # self._add_pool_balance(
-                        #     cur, 'company_points', points_to_deduct,
-                        #     f"周补贴扣除积分转入 - 用户{user_id}扣除{points_to_deduct:.4f}分",
-                        #     related_user=user_id
-                        # )
-                        # 【关键修复】从 subsidy_pool 扣除发放的 subsidy_amount
+
                         try:
                             self._add_pool_balance(
                                 cur, 'subsidy_pool', -subsidy_amount,
-                                f"周补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
+                                f"日补贴发放 - 用户{user_id}获得{points_to_add:.4f}点数",
                                 related_user=None
                             )
                         except InsufficientBalanceException:
                             logger.error(f"补贴池余额不足，无法发放用户{user_id}的补贴")
                             raise FinanceException("补贴池余额不足，发放失败")
 
-                        # 记录发放历史
                         cur.execute(
                             """INSERT INTO weekly_subsidy_records 
-                               (user_id, week_start, subsidy_amount, points_before, points_deducted)
-                               VALUES (%s, %s, %s, %s, %s)""",
-                            (user_id, today, subsidy_amount, member_points, points_to_deduct)
+                               (user_id, week_start, subsidy_amount, points_before, points_deducted, remark)
+                               VALUES (%s, %s, %s, %s, %s, %s)""",
+                            (user_id, today, subsidy_amount, member_points, points_to_deduct,
+                             f"日补贴（每日可分配金额{daily_available:.4f}）")
                         )
 
                         total_distributed += subsidy_amount
                         total_points_deducted += points_to_deduct
                         logger.info(
-                            f"用户{user_id}: 发放补贴点数{points_to_add:.4f}, "
-                            f"扣减积分{points_to_deduct:.4f}, 余额{new_balance:.4f}, "
+                            f"用户{user_id}: 发放点数{points_to_add:.4f}, 扣减积分{points_to_deduct:.4f}"
                         )
 
-                    # ==================== 新增：平台积分池补贴发放给用户26 ====================
+                    # ========== 用户26平台积分池特殊发放 ==========
                     try:
                         logger.info("开始处理平台积分池(company_points)补贴发放给用户26")
-
-                        # 重新查询平台积分池余额（获取最新值）
                         cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
                         cp_current_row = cur.fetchone()
                         company_points_current = Decimal(
                             str(cp_current_row['balance'] or 0)) if cp_current_row else Decimal('0')
 
-                        if company_points_current <= 0:
-                            logger.info("平台积分池余额为0，跳过用户26的特殊发放")
-                        else:
-                            # 计算发放金额（company_points × 积分值），就像普通用户的积分一样计算
+                        if company_points_current > 0:
                             platform_subsidy_amount = company_points_current * points_value
 
-                            if platform_subsidy_amount <= Decimal('0'):
-                                logger.info("计算发放金额为0，跳过用户26发放")
-                            else:
-                                # 【关键逻辑】扣除的积分数值 = 发放的点数数值（和用户逻辑一致）
-                                company_points_to_deduct = platform_subsidy_amount
-
-                                # 检查补贴池余额是否充足（平台积分发放也需要从补贴池扣钱）
+                            if platform_subsidy_amount > Decimal('0'):
                                 cur.execute("SELECT balance FROM finance_accounts WHERE account_type = 'subsidy_pool'")
                                 subsidy_pool_row = cur.fetchone()
                                 current_subsidy_pool = Decimal(
                                     str(subsidy_pool_row['balance'] or 0)) if subsidy_pool_row else Decimal('0')
 
                                 if current_subsidy_pool < platform_subsidy_amount:
-                                    logger.error(
-                                        f"补贴池余额不足，无法发放用户26的平台积分补贴。需要¥{platform_subsidy_amount:.4f}，当前¥{current_subsidy_pool:.4f}")
+                                    logger.error(f"补贴池余额不足，无法发放用户26的平台积分补贴")
                                     raise FinanceException("补贴池余额不足，无法完成平台积分补贴发放")
 
-                                # 1. 给用户26发放 subsidy_points 和 true_total_points
                                 cur.execute(
                                     "UPDATE users SET subsidy_points = COALESCE(subsidy_points, 0) + %s, true_total_points = COALESCE(true_total_points, 0) + %s WHERE id = %s",
                                     (platform_subsidy_amount, platform_subsidy_amount, 26)
                                 )
 
-                                # 检查用户是否存在
                                 if cur.rowcount == 0:
                                     logger.error("用户26不存在，无法发放平台积分补贴")
                                     raise FinanceException("用户26不存在")
 
-                                # 2. 扣减 company_points（平台积分池）- 扣除等额的积分数值（不是全部）
                                 self._add_pool_balance(
-                                    cur, 'company_points', -company_points_to_deduct,
-                                    f"周补贴发放 - 平台积分池发放给用户26，基数{company_points_current:.4f}分，积分值{points_value:.4f}，发放{company_points_to_deduct:.4f}点数，扣除等额积分{company_points_to_deduct:.4f}",
+                                    cur, 'company_points', -platform_subsidy_amount,
+                                    f"日补贴发放 - 平台积分池发放给用户26",
                                     related_user=26
                                 )
 
-                                # 3. 扣减 subsidy_pool（补贴池资金）- 扣除等值金额
                                 self._add_pool_balance(
                                     cur, 'subsidy_pool', -platform_subsidy_amount,
-                                    f"周补贴发放 - 平台积分补贴用户26，扣除补贴池资金¥{platform_subsidy_amount:.4f}",
+                                    f"日补贴发放 - 平台积分补贴用户26",
                                     related_user=26
                                 )
 
-                                # 4. 记录用户26的补贴点数流水（points_log）- 类型为 company 表示平台积分来源
                                 cur.execute(
                                     "SELECT subsidy_points FROM users WHERE id = %s", (26,)
                                 )
                                 user26_subsidy_balance = Decimal(str(cur.fetchone()['subsidy_points'] or 0))
-
                                 cur.execute(
                                     """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) 
                                        VALUES (%s, %s, %s, 'company', %s, NULL, NOW())""",
                                     (26, platform_subsidy_amount, user26_subsidy_balance,
-                                     f"平台积分池补贴发放（company_points基数:{company_points_current:.4f} × 积分值:{points_value:.4f} = 发放{platform_subsidy_amount:.4f}点数，扣除积分{company_points_to_deduct:.4f}）")
+                                     f"平台积分池日补贴发放")
                                 )
 
-                                # 5. 记录 company_points 的积分变动到 points_log（便于追踪）
-                                try:
-                                    cur.execute(
-                                        "SELECT balance FROM finance_accounts WHERE account_type = 'company_points'")
-                                    cp_after_balance = Decimal(str(cur.fetchone()['balance'] or 0))
-
-                                    cur.execute(
-                                        """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at) 
-                                           VALUES (%s, %s, %s, %s, %s, NULL, NOW())""",
-                                        (PLATFORM_MERCHANT_ID, -company_points_to_deduct, cp_after_balance, 'company',
-                                         f"用户26平台积分补贴发放，扣除积分{company_points_to_deduct:.4f}（发放点数等额）")
-                                    )
-                                except Exception as e:
-                                    logger.debug(f"记录平台积分池积分流水失败: {e}")
-
-                                # 6. 记录到 weekly_subsidy_records（标记为平台积分来源）
                                 cur.execute(
                                     """INSERT INTO weekly_subsidy_records 
                                        (user_id, week_start, subsidy_amount, points_before, points_deducted, remark)
                                        VALUES (%s, %s, %s, %s, %s, %s)""",
                                     (26, today, platform_subsidy_amount, company_points_current,
-                                     company_points_to_deduct,
-                                     f"平台积分池发放（基数{company_points_current:.4f}×积分值{points_value:.4f}，扣除积分{company_points_to_deduct:.4f}）")
+                                     platform_subsidy_amount,
+                                     f"平台积分池日补贴发放（每日可分配金额{daily_available:.4f}）")
                                 )
 
                                 total_distributed += platform_subsidy_amount
-                                logger.info(
-                                    f"【特殊发放】用户26获得平台积分补贴: ¥{platform_subsidy_amount:.4f} "
-                                    f"(company_points: {company_points_current:.4f} × {points_value:.4f})，"
-                                    f"扣除company_points积分: {company_points_to_deduct:.4f}（等额），"
-                                    f"扣除补贴池资金: ¥{platform_subsidy_amount:.4f}"
-                                )
-
-                    except InsufficientBalanceException:
-                        logger.error(f"❌ 用户26平台积分补贴发放失败: 资金池余额不足")
-                        raise FinanceException("平台积分补贴发放失败: 资金池余额不足")
+                                logger.info(f"用户26获得平台积分补贴: ¥{platform_subsidy_amount:.4f}")
+                            else:
+                                logger.info("计算发放金额为0，跳过用户26发放")
+                        else:
+                            logger.info("平台积分池余额为0，跳过用户26的特殊发放")
                     except Exception as e:
-                        logger.error(f"❌ 用户26平台积分补贴发放失败: {e}", exc_info=True)
-                        # 如果需要严格事务，可以取消下面的注释，让错误中断整个发放
-                        # raise
-                    # ===================================================================
+                        logger.error(f"用户26平台积分补贴发放失败: {e}", exc_info=True)
 
-                    # 提交事务（包含普通用户发放和用户26的特殊发放）
                     conn.commit()
 
-            # 如果设置了 auto_clear=true，发放完成后自动清除手动配置
             if auto_clear:
                 logger.info("发放完成，自动清除手动积分值配置")
                 self.adjust_subsidy_points_value(None)
 
-            logger.info(f"周补贴完成: 发放¥{total_distributed:.4f}等值点数，"
-                        f"扣除用户积分{total_points_deducted:.4f}分 + 平台积分{company_points_to_deduct if 'company_points_to_deduct' in locals() else 0:.4f}分，"
-                        f"涉及{len(users)}个普通用户 + 用户26(平台积分)")
+            logger.info(
+                f"日补贴完成: 发放¥{total_distributed:.4f}等值点数，当日可分配¥{daily_available:.4f}，剩余补贴池¥{pool_balance - daily_available:.4f}")
             return True
 
         except InsufficientBalanceException:
-            logger.error(f"❌ 周补贴发放失败: 补贴池余额不足")
+            logger.error(f"❌ 日补贴发放失败: 补贴池余额不足")
             raise FinanceException("补贴池余额不足，无法完成发放")
         except Exception as e:
-            logger.error(f"❌ 周补贴发放失败: {e}", exc_info=True)
+            logger.error(f"❌ 日补贴发放失败: {e}", exc_info=True)
             return False
 
     # ==================== 关键修改4：退款逻辑使用member_points ====================
