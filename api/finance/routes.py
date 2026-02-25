@@ -97,19 +97,19 @@ async def adjust_subsidy_points_value(
     except Exception as e:
         logger.error(f"调整积分值失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-@router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放周补贴")
+@router.post("/api/subsidy/distribute", response_model=ResponseModel, summary="发放日补贴")
 async def distribute_subsidy(
         service: FinanceService = Depends(get_finance_service)
 ):
-    """手动触发周补贴发放（发放 subsidy_points 专用点数）"""
+    """手动触发日补贴发放（每日最多使用补贴池余额的5%）"""
     try:
-        success = service.distribute_weekly_subsidy()
+        success = service.distribute_daily_subsidy()  # 方法名也改为 daily
         if success:
-            return ResponseModel(success=True, message="周补贴发放成功（增加 subsidy_points）")
+            return ResponseModel(success=True, message="日补贴发放成功（增加 subsidy_points）")
         else:
             raise HTTPException(status_code=500, detail="补贴发放失败，请检查日志")
     except Exception as e:
-        logger.error(f"周补贴失败: {e}")
+        logger.error(f"日补贴失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -217,22 +217,23 @@ async def distribute_unilevel_dividend(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/api/subsidy/fund", response_model=ResponseModel, summary="预存补贴资金")
+@router.post("/api/subsidy/fund", response_model=ResponseModel, summary="增加补贴资金（累加）")
 async def fund_subsidy_pool(
         service: FinanceService = Depends(get_finance_service),
-        amount: float = Query(10000, gt=0)
+        amount: float = Query(..., gt=0, description="要增加的金额")
 ):
+    """手动增加补贴池余额（累加模式），例如增加2000元"""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE finance_accounts SET balance = %s WHERE account_type = 'subsidy_pool'",
+                    "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'subsidy_pool'",
                     (amount,)
                 )
                 conn.commit()
-        return ResponseModel(success=True, message=f"补贴池已预存¥{amount:.2f}")
+        return ResponseModel(success=True, message=f"补贴池已增加¥{amount:.2f}")
     except Exception as e:
-        logger.error(f"预存补贴失败: {e}")
+        logger.error(f"增加补贴资金失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1316,6 +1317,32 @@ async def list_merchant_withdraw_records(
         )
     except Exception as e:
         logger.error(f"查询商户提现记录列表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== 日补贴比例调整接口 ====================
+@router.post("/api/subsidy/daily-ratio/adjust", response_model=ResponseModel, summary="调整日补贴比例")
+async def adjust_daily_subsidy_ratio(
+    ratio: float = Query(..., gt=0, le=1, description="日补贴比例，0-1之间"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    """手动调整每日可发放的补贴池比例（默认0.05）"""
+    try:
+        success = service.set_daily_subsidy_ratio(ratio)
+        if success:
+            return ResponseModel(success=True, message=f"日补贴比例已调整为: {ratio:.2%}")
+        else:
+            raise HTTPException(status_code=500, detail="调整失败")
+    except Exception as e:
+        logger.error(f"调整日补贴比例失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/subsidy/daily-ratio", response_model=ResponseModel, summary="查询当前日补贴比例")
+async def get_daily_subsidy_ratio(service: FinanceService = Depends(get_finance_service)):
+    try:
+        ratio = service.get_daily_subsidy_ratio()
+        return ResponseModel(success=True, message="查询成功", data={"daily_ratio": float(ratio)})
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
