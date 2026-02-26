@@ -758,6 +758,23 @@ class DatabaseManager:
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
 
+            'bankcard_verify_codes': """
+            CREATE TABLE IF NOT EXISTS bankcard_verify_codes (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT UNSIGNED NOT NULL COMMENT '用户ID',
+                account_number_hash VARCHAR(64) NOT NULL COMMENT '银行卡号哈希（用于匹配）',
+                verify_code VARCHAR(6) NOT NULL COMMENT '验证码',
+                session_id VARCHAR(64) NOT NULL COMMENT '会话ID',
+                status TINYINT NOT NULL DEFAULT 0 COMMENT '0=未使用 1=已使用 2=已过期',
+                expired_at DATETIME NOT NULL COMMENT '过期时间',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                used_at DATETIME NULL COMMENT '使用时间',
+                INDEX idx_user_card (user_id, account_number_hash),
+                INDEX idx_session (session_id),
+                INDEX idx_expired (expired_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+
             'store_logos': """
             CREATE TABLE IF NOT EXISTS store_logos (
                 id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY COMMENT 'LOGO ID',

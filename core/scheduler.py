@@ -71,6 +71,14 @@ class TaskScheduler:
             misfire_grace_time=3600
         )
 
+        # ==================== 每小时清理过期银行卡验证码 ====================
+        self.scheduler.add_job(
+            self.clean_expired_bankcard_codes,
+            CronTrigger(hour="*", minute=30),
+            id="clean_expired_bankcard_codes",
+            replace_existing=True
+        )
+
         self.scheduler.start()
         logger.info("定时任务管理器已启动")
 
@@ -120,6 +128,15 @@ class TaskScheduler:
         """关闭定时任务"""
         self.scheduler.shutdown()
         logger.info("定时任务管理器已关闭")
+
+    def clean_expired_bankcard_codes(self):
+        """清理过期银行卡验证码"""
+        try:
+            from services.bankcard_service import BankcardService
+            deleted = BankcardService.clean_expired_codes()
+            logger.info(f"[定时任务] 清理过期银行卡验证码: {deleted}条")
+        except Exception as e:
+            logger.error(f"[定时任务] 清理过期验证码失败: {e}")
 
     def clean_expired_drafts(self):
         """清理过期草稿"""

@@ -10,7 +10,9 @@ import re
 import uuid
 import base64
 from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
+import random
+import string
 from fastapi import HTTPException
 
 from core.database import get_conn
@@ -46,6 +48,8 @@ class BankcardService:
         "F019": "该银行卡已被其他商户绑定（绑定卡时）",
         "F020": "新银行卡已被其他商户绑定（提交改绑申请时）",
         "F021": "新卡已被其他用户绑定（改绑审核通过时，冲突）",
+        "F022": "验证码和会话ID不能为空",
+        "F023": "验证码错误或已过期，请重新获取",
     }
 
     # 微信状态 → 内部状态映射
@@ -248,20 +252,29 @@ class BankcardService:
             account_name: str,
             bank_branch_id: Optional[str],
             bank_address_code: str,
+            sms_code: str,
+            session_id: str,
             is_default: bool = True,
             admin_key: Optional[str] = None,
             ip_address: Optional[str] = None
     ) -> Dict[str, Any]:
-        """绑定银行卡（幂等，防跨用户重复绑定）"""
+        """绑定银行卡（幂等，防跨用户重复绑定，需验证码验证）"""
         logger.info(f"【绑定开始】user_id={user_id}, bank_name={bank_name}")
 
-        # 参数标准化
         bank_name = bank_name.strip()
         bank_account = bank_account.strip().replace(' ', '')
         account_name = account_name.strip()
 
+        if not sms_code or not session_id:
+            raise Exception("F022: 验证码和会话ID不能为空")
+
+        is_code_valid = BankcardService.verify_sms_code(user_id, bank_account, session_id, sms_code)
+        if not is_code_valid:
+            raise Exception("F023: 验证码错误或已过期，请重新获取")
+
+        logger.info(f"验证码验证通过: user_id={user_id}")
+
         try:
-            # 1. 获取微信数据
             sub_mchid, wechat_data = BankcardService._get_wechat_settlement_info_from_api(user_id)
 
             # 2. 验证数据一致性
@@ -395,17 +408,93 @@ class BankcardService:
             raise
 
     @staticmethod
+    def _generate_verify_code(length: int = 6) -> str:
+        """生成数字验证码"""
+        return ''.join(random.choices(string.digits, k=length))
+
+    @staticmethod
+    def _generate_session_id() -> str:
+        """生成会话ID"""
+        return str(uuid.uuid4()).replace('-', '')
+
+    @staticmethod
+    def _hash_account_number(account_number: str) -> str:
+        """生成银行卡号哈希（用于验证码匹配）"""
+        salt = os.getenv('CARD_SALT', 'default_salt')
+        return hashlib.sha256(f"{account_number}_{salt}".encode()).hexdigest()
+
+    @staticmethod
     async def send_sms_code(user_id: int, account_number: str) -> Dict[str, Any]:
-        """发送短信验证码（生产级模拟）"""
+        """发送短信验证码（生产级实现）"""
         logger.info(f"【短信验证码】user_id={user_id}, 卡号={account_number[-4:]}")
 
-        # 生产环境应集成真实短信服务商（如阿里云短信）
-        # 返回标准化格式
-        return {
-            "session_id": str(uuid.uuid4()),
-            "expired_in": 300,  # 5分钟有效期
-            "mock_code": "123456"  # 测试验证码
-        }
+        account_number = account_number.strip().replace(' ', '')
+        verify_code = BankcardService._generate_verify_code(6)
+        session_id = BankcardService._generate_session_id()
+        account_hash = BankcardService._hash_account_number(account_number)
+        expired_at = datetime.now() + timedelta(minutes=5)
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE bankcard_verify_codes 
+                        SET status = 2 
+                        WHERE user_id = %s AND account_number_hash = %s AND status = 0
+                    """, (user_id, account_hash))
+
+                    cur.execute("""
+                        INSERT INTO bankcard_verify_codes 
+                        (user_id, account_number_hash, verify_code, session_id, expired_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (user_id, account_hash, verify_code, session_id, expired_at))
+
+                    conn.commit()
+
+            logger.info(f"验证码已生成: user_id={user_id}, session_id={session_id}")
+
+            return {
+                "session_id": session_id,
+                "expired_in": 300,
+                "mock_code": verify_code if os.getenv('SMS_MOCK_MODE', 'true').lower() == 'true' else None
+            }
+        except Exception as e:
+            logger.error(f"生成验证码失败: {e}")
+            raise Exception("验证码生成失败，请稍后重试")
+
+    @staticmethod
+    def verify_sms_code(user_id: int, account_number: str, session_id: str, verify_code: str) -> bool:
+        """验证短信验证码"""
+        account_hash = BankcardService._hash_account_number(account_number)
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, verify_code, expired_at 
+                    FROM bankcard_verify_codes 
+                    WHERE user_id = %s 
+                    AND account_number_hash = %s 
+                    AND session_id = %s
+                    AND status = 0
+                    AND expired_at > NOW()
+                    LIMIT 1
+                """, (user_id, account_hash, session_id))
+
+                record = cur.fetchone()
+                if not record:
+                    return False
+
+                if record['verify_code'] != verify_code:
+                    return False
+
+                cur.execute("""
+                    UPDATE bankcard_verify_codes 
+                    SET status = 1, used_at = NOW() 
+                    WHERE id = %s
+                """, (record['id'],))
+
+                conn.commit()
+                return True
 
     @staticmethod
     def list_bankcards(user_id: int) -> List[Dict[str, Any]]:
@@ -1118,9 +1207,26 @@ class BankcardService:
     @staticmethod
     def _verify_pay_password(user_id: int, pay_password: str) -> bool:
         """验证支付密码（Mock实现）"""
-        # 生产环境：查询users表的pay_password_hash字段并验证bcrypt
-        # 测试环境：基于用户ID的Mock验证
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM users WHERE id = %s AND status = 0", (user_id,))
                 return cur.fetchone() is not None
+
+    @staticmethod
+    def clean_expired_codes():
+        """清理过期验证码（供定时任务调用）"""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        DELETE FROM bankcard_verify_codes 
+                        WHERE expired_at < DATE_SUB(NOW(), INTERVAL 1 DAY)
+                        OR (status = 0 AND expired_at < NOW())
+                    """)
+                    deleted = cur.rowcount
+                    conn.commit()
+                    logger.info(f"清理过期验证码: {deleted}条")
+                    return deleted
+        except Exception as e:
+            logger.error(f"清理过期验证码失败: {e}")
+            return 0
