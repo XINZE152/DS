@@ -20,7 +20,8 @@ class BankcardBindRequest(BaseModel):
     bank_name: str = Field(..., min_length=2, max_length=128, description="开户行全称（含支行）")
     bank_branch_id: Optional[str] = Field(None, max_length=128, description="开户行联行号")
     bank_address_code: str = Field(..., pattern=r'^\d{6}$', description="开户地区码(6位数字)")
-    sms_code: str = Field(..., description="短信验证码")
+    sms_code: str = Field(..., pattern=r'^\d{6}$', description="短信验证码（6位数字）")
+    session_id: str = Field(..., min_length=32, description="验证码会话ID（从发送接口获取）")
 
     @validator('account_number')
     def validate_account_number(cls, v):
@@ -37,7 +38,8 @@ class BankcardBindRequest(BaseModel):
                 "bank_name": "中国工商银行股份有限公司北京朝阳支行",
                 "bank_branch_id": "402713354941",
                 "bank_address_code": "110105",
-                "sms_code": "123456"
+                "sms_code": "123456",
+                "session_id": "a1b2c3d4e5f6789012345678abcdef123456"
             }
         }
 
@@ -74,12 +76,12 @@ class BankcardModifyRequest(BaseModel):
 
 # ============= API路由（保持不变） =============
 
-@router.post("/bind", summary="绑定银行卡", tags=["银行卡管理"])
+@router.post("/bind", summary="绑定银行卡（需验证码）", tags=["银行卡管理"])
 async def bind_bankcard(
     request: BankcardBindRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """绑定银行卡（需先完成微信进件，自动同步微信数据）"""
+    """绑定银行卡（需先完成微信进件，自动同步微信数据，需短信验证码）"""
     try:
         result = BankcardService.bind_bankcard(
             user_id=current_user["id"],
@@ -88,28 +90,49 @@ async def bind_bankcard(
             account_name=request.account_name,
             bank_branch_id=request.bank_branch_id,
             bank_address_code=request.bank_address_code,
-            is_default=True,  # 首次绑定设为默认
+            sms_code=request.sms_code,
+            session_id=request.session_id,
+            is_default=True,
             admin_key=None,
             ip_address="127.0.0.1"
         )
         return {"code": 0, "message": "绑定成功", "data": result}
     except Exception as e:
         logger.error(f"绑定失败: {e}")
+        error_msg = str(e)
+        if error_msg.startswith("F"):
+            code = error_msg.split(":")[0]
+            message = error_msg.split(":", 1)[1].strip() if ":" in error_msg else error_msg
+            raise HTTPException(status_code=400, detail=f"{code}: {message}")
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/sms/send", summary="发送短信验证码（测试环境返回模拟验证码）", tags=["银行卡管理"])
+@router.post("/sms/send", summary="发送短信验证码", tags=["银行卡管理"])
 async def send_sms_code(
-    account_number: str = Form(..., description="银行卡号"),
-    current_user: dict = Depends(get_current_user)
+        account_number: str = Form(..., description="银行卡号", pattern=r'^\d{16,30}$'),
+        current_user: dict = Depends(get_current_user)
 ):
-    """发送短信验证码（Mock模式返回固定验证码123456）"""
+    """发送短信验证码（测试环境返回模拟验证码，生产环境真实发送）"""
     try:
         result = await BankcardService.send_sms_code(
             user_id=current_user["id"],
             account_number=account_number
         )
-        return {"code": 0, "message": "验证码已发送", "data": result}
+
+        response = {
+            "code": 0,
+            "message": "验证码已发送",
+            "data": {
+                "session_id": result["session_id"],
+                "expired_in": result["expired_in"]
+            }
+        }
+
+        if result.get("mock_code"):
+            response["data"]["mock_code"] = result["mock_code"]
+            response["message"] = "验证码已发送（测试模式）"
+
+        return response
     except Exception as e:
         logger.error(f"发送验证码失败: {e}")
         raise HTTPException(status_code=400, detail=str(e))
