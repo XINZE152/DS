@@ -7,6 +7,7 @@ from typing import Union
 from core.database import get_conn
 from core.auth import get_current_user          # 如需登录鉴权
 from core.logging import get_logger
+from core.config import settings
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from services.offline_service import OfflineService   # 业务逻辑层（稍后实现）
 import xmltodict
@@ -46,6 +47,56 @@ class OrderDetailRsp(BaseModel):
 class RefundReq(BaseModel):
     order_no: str
     refund_amount: Optional[int] = None
+
+
+# ------------------ 0. 微信支付配置检查 ------------------
+@router.get("/zhifu/config-check", summary="检查微信支付配置状态")
+async def check_wechat_pay_config(
+        current_user: dict = Depends(get_current_user)
+):
+    """
+    检查当前微信支付配置状态，用于排查支付问题
+    """
+    config_status = {
+        "wx_mock_mode": settings.WX_MOCK_MODE,
+        "app_id_configured": bool(settings.WECHAT_APP_ID),
+        "mch_id_configured": bool(settings.WECHAT_PAY_MCH_ID),
+        "api_v3_key_configured": bool(settings.WECHAT_PAY_API_V3_KEY) and len(settings.WECHAT_PAY_API_V3_KEY) > 0,
+        "cert_path_configured": bool(settings.WECHAT_PAY_API_CERT_PATH),
+        "key_path_configured": bool(settings.WECHAT_PAY_API_KEY_PATH),
+        "pub_key_id_configured": bool(settings.WECHAT_PAY_PUB_KEY_ID),
+        "notify_url_configured": bool(settings.WECHAT_PAY_NOTIFY_URL),
+    }
+
+    # 检查证书文件是否存在
+    import os
+    if settings.WECHAT_PAY_API_CERT_PATH:
+        config_status["cert_file_exists"] = os.path.exists(settings.WECHAT_PAY_API_CERT_PATH)
+    if settings.WECHAT_PAY_API_KEY_PATH:
+        config_status["key_file_exists"] = os.path.exists(settings.WECHAT_PAY_API_KEY_PATH)
+    if settings.WECHAT_PAY_PUBLIC_KEY_PATH:
+        config_status["pub_key_file_exists"] = os.path.exists(settings.WECHAT_PAY_PUBLIC_KEY_PATH)
+
+    # 判断整体状态
+    is_fully_configured = (
+            not settings.WX_MOCK_MODE and
+            config_status["app_id_configured"] and
+            config_status["mch_id_configured"] and
+            config_status["api_v3_key_configured"] and
+            config_status.get("cert_file_exists", False) and
+            config_status.get("key_file_exists", False)
+    )
+
+    config_status["is_fully_configured"] = is_fully_configured
+
+    if settings.WX_MOCK_MODE:
+        config_status["warning"] = "当前处于 Mock 模式，支付将使用模拟数据，不会真正扣款"
+    elif not is_fully_configured:
+        config_status["warning"] = "微信支付配置不完整，可能导致支付失败"
+    else:
+        config_status["message"] = "微信支付配置正常"
+
+    return {"code": 0, "message": "查询成功", "data": config_status}
 
 
 class UnifiedOrderBody(BaseModel):
@@ -138,12 +189,19 @@ async def unified_order(
     if not openid:
         logger.error(f"用户 {current_user['id']} 未绑定微信 openid")
         raise HTTPException(status_code=400, detail="用户未绑定微信，无法支付")
+
     # 从 body 或 query 取 total_fee（单位：分），供后端调微信统一下单使用
     total_fee = None
     if body and body.total_fee is not None and body.total_fee > 0:
         total_fee = body.total_fee
     elif total_fee_query is not None and total_fee_query > 0:
         total_fee = total_fee_query
+
+    # 记录日志，方便排查
+    logger.info(f"[unified_order] 订单={order_no}, 用户={current_user['id']}, "
+                f"coupon_id={coupon_id}, total_fee={total_fee}, "
+                f"mock_mode={settings.WX_MOCK_MODE}")
+
     try:
         result = await OfflineService.unified_order(
             order_no=order_no,
@@ -152,10 +210,23 @@ async def unified_order(
             openid=openid,
             total_fee=total_fee,
         )
-        
+
+        # 检查返回的支付参数
+        pay_params = result.get("pay_params", {})
+        if not pay_params.get("paySign"):
+            logger.error(f"[unified_order] 支付参数缺少 paySign: {pay_params}")
+            raise HTTPException(status_code=500, detail="支付参数生成失败，缺少签名")
+
+        # 如果是 Mock 模式，添加警告信息
+        if settings.WX_MOCK_MODE:
+            result["warning"] = "当前处于 Mock 模式，支付不会真正扣款"
+            result["is_mock"] = True
+        else:
+            result["is_mock"] = False
+
         return {
-            "code": 0, 
-            "message": "统一下单成功", 
+            "code": 0,
+            "message": "统一下单成功",
             "data": {
                 "order_no": order_no,
                 "wechat_pay_params": result["pay_params"],
@@ -163,7 +234,9 @@ async def unified_order(
                     "original_amount": result["original_amount"],
                     "coupon_discount": result["coupon_discount"],
                     "final_amount": result["final_amount"]
-                }
+                },
+                "is_mock": result.get("is_mock", False),
+                "warning": result.get("warning")
             }
         }
     except ValueError as e:
@@ -196,7 +269,7 @@ async def list_orders(
         raise HTTPException(status_code=400, detail="请传入 merchant_id 或 user_id 其中一个参数")
     if merchant_id and user_id:
         raise HTTPException(status_code=400, detail="merchant_id 和 user_id 不能同时传入")
-    
+
     try:
         result = await OfflineService.list_orders(
             merchant_id=merchant_id,
