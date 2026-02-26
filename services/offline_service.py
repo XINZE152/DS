@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import Optional, Union, TYPE_CHECKING
+import os
 
 if TYPE_CHECKING:
     from wechatpayv3 import WeChatPay      # 仅为静态检查服务
@@ -156,7 +157,6 @@ class OfflineService:
 
         return {**order, "coupons": coupons}
 
-    # ---------- 4. 统一下单（核销优惠券 + 调起支付）----------
     @staticmethod
     async def unified_order(
             order_no: str,
@@ -167,6 +167,12 @@ class OfflineService:
     ) -> dict:
         """total_fee: 单位分，前端传入；当库内金额为 0 或异常时用作兜底传给微信统一下单。"""
         current_user_id = str(user_id)  # 当前登录用户ID（顾客）
+
+        # ========== 新增：检查微信支付配置 ==========
+        if settings.WX_MOCK_MODE:
+            logger.warning("⚠️ 当前处于微信支付 Mock 模式，将返回模拟支付参数")
+            logger.warning("⚠️ 如需真实支付，请设置 WX_MOCK_MODE=false 并配置正确的商户信息")
+
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 1. 查询订单原始金额（仅用订单号，移除商家ID条件）
@@ -216,39 +222,54 @@ class OfflineService:
         if amount_for_wx <= 0:
             raise ValueError("订单金额异常或未传 total_fee，无法发起支付")
 
-        # 4. ====== 使用 openid 与 amount 调用微信统一下单 ======
+        # 4. 调用微信统一下单
         try:
-            from services.notify_service import async_unified_order
-            
-            pay_result = await async_unified_order({
-                'out_trade_no': order_no,
-                'amount': {'total': amount_for_wx},  # 单位：分
-                'payer': {'openid': openid},
-                'description': f'线下订单-{row.get("store_name", "")}'
-            })
-            
-            prepay_id = pay_result.get('prepay_id')
-            if not prepay_id:
-                logger.error(f"微信支付返回异常: {pay_result}")
-                raise ValueError("获取支付参数失败")
-            
-            # 5. 生成前端调起支付用的参数（仅 6 个字段，不包含 total_fee，避免 wx.requestPayment 报错）
-            import uuid, time
-            timestamp = str(int(time.time()))
-            nonce_str = uuid.uuid4().hex
-            
-            if wxpay:
-                pay_params = wxpay.get_jsapi_params(prepay_id=prepay_id, timestamp=timestamp, nonce_str=nonce_str)
-            else:
+            # ========== 修改：优先使用核心微信支付客户端 ==========
+            from core.wx_pay_client import wxpay_client
+
+            if settings.WX_MOCK_MODE:
+                # Mock 模式：生成模拟支付参数
+                logger.info(f"[MOCK] 模拟统一下单: order_no={order_no}, amount={amount_for_wx}")
+                prepay_id = f"MOCK_PREPAY_{int(datetime.now().timestamp())}_{user_id}"
+
+                # 生成 Mock 支付参数（使用 RSA 签名格式，但值为 mock）
+                import uuid, time
+                timestamp = str(int(time.time()))
+                nonce_str = uuid.uuid4().hex
+
                 pay_params = {
                     "appId": settings.WECHAT_APP_ID,
                     "timeStamp": timestamp,
                     "nonceStr": nonce_str,
                     "package": f"prepay_id={prepay_id}",
                     "signType": "RSA",
-                    "paySign": "mock_sign",
+                    "paySign": "MOCK_SIGN_PLACEHOLDER",  # Mock 签名，前端可识别
                 }
-            # 不向 pay_params 写入 total_fee，前端只拿此对象调 wx.requestPayment
+
+                logger.info(f"[MOCK] 返回支付参数: {pay_params}")
+            else:
+                # 真实微信支付模式
+                logger.info(f"[WeChatPay] 调用真实统一下单: order_no={order_no}, amount={amount_for_wx}")
+
+                # 使用核心微信支付客户端创建订单
+                store_name = row.get('store_name', '') if row else ''
+                wx_response = wxpay_client.create_jsapi_order(
+                    out_trade_no=order_no,
+                    total_fee=amount_for_wx,
+                    openid=openid,
+                    description=f"线下订单-{store_name}"
+                )
+
+                prepay_id = wx_response.get('prepay_id')
+                if not prepay_id:
+                    logger.error(f"微信统一下单失败: {wx_response}")
+                    raise ValueError(f"微信统一下单失败: {wx_response.get('message', '未知错误')}")
+
+                logger.info(f"[WeChatPay] 获取 prepay_id 成功: {prepay_id}")
+
+                # 使用核心客户端生成前端支付参数（包含真实签名）
+                pay_params = wxpay_client.generate_jsapi_pay_params(prepay_id)
+                logger.info(f"[WeChatPay] 生成支付参数成功")
 
             return {
                 "pay_params": pay_params,
@@ -256,7 +277,7 @@ class OfflineService:
                 "coupon_discount": coupon_discount,
                 "final_amount": final_amount
             }
-            
+
         except Exception as e:
             logger.error(f"微信支付调用失败: {e}", exc_info=True)
             raise ValueError(f"支付调用失败: {str(e)}")
