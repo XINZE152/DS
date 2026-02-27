@@ -85,8 +85,8 @@ async def get_current_points_value(
         raise HTTPException(status_code=500, detail=str(e))
 @router.post("/api/subsidy/points-value/adjust", response_model=ResponseModel, summary="调整积分值")
 async def adjust_subsidy_points_value(
-        points_value: Optional[float] = Query(None, ge=0, le=0.0005,
-                                              description="积分值（0-0.0005），不传或传null取消手动调整"),
+        points_value: Optional[float] = Query(None, ge=0, le=0.005,  # ← 改为 0.005
+                                              description="积分值（0-0.005），不传或传null取消手动调整"),
         auto_clear: bool = Query(True, description="是否在发放一次后自动清除，默认为true"),
         service: FinanceService = Depends(get_finance_service)
 ):
