@@ -319,8 +319,9 @@ class FinanceService:
                     user_id
                 )
 
-            # ========== 新增：公司积分池独立增加（基于实付金额的20%） ==========
-            company_points_amount = (distribution_base * Decimal('0.20')).quantize(Decimal('0.0001'))
+            # ========== 新增：公司积分池独立增加（基于实付金额+优惠券金额的20%） ==========
+            base_for_company = final_amount + coupon_discount
+            company_points_amount = (base_for_company * Decimal('0.20')).quantize(Decimal('0.0001'))
             cur.execute(
                 "UPDATE finance_accounts SET balance = balance + %s WHERE account_type = 'company_points'",
                 (company_points_amount,)
@@ -333,7 +334,7 @@ class FinanceService:
                    flow_type, remark, created_at)
                    VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
                 ('company_points', PLATFORM_MERCHANT_ID, company_points_amount, cp_new_balance, 'income',
-                 f"订单#{order_no} 公司积分池+20% ¥{company_points_amount:.4f}")
+                 f"订单#{order_no} 公司积分池+20% (实付¥{final_amount:.2f}+优惠券¥{coupon_discount:.2f})")
             )
             # 可选：在 points_log 中也记录公司积分池变动（便于积分报表）
             try:
@@ -3057,8 +3058,6 @@ class FinanceService:
                 }
 
     # ==================== 1. 优惠券直接发放 ====================
-    # 在 services/finance_service.py 中
-
     def distribute_coupon_directly(self, user_id: int, amount: float,
                                    coupon_type: str = 'user',
                                    applicable_product_type: str = 'all',  # 新增参数
@@ -3127,6 +3126,143 @@ class FinanceService:
         except Exception as e:
             logger.error(f"❌ 直接发放优惠券失败: {e}")
             raise FinanceException(f"发放失败: {e}")
+
+    # ==================== 资金池转正功能 ====================
+    def transform_pool_to_coupon(
+            self,
+            pool_type: str,
+            user_id: int,
+            amount: Decimal,
+            coupon_type: str = 'user',
+            applicable_product_type: str = 'all',
+            remark: str = None
+    ) -> int:
+        """
+        将指定资金池的金额转化为优惠券赠送给用户
+        :param pool_type: 资金池类型（如 'public_welfare'）
+        :param user_id: 接收优惠券的用户ID
+        :param amount: 转正金额（正数）
+        :param coupon_type: 优惠券类型 'user'/'merchant'
+        :param applicable_product_type: 适用商品范围
+        :param remark: 操作备注
+        :return: 优惠券ID
+        """
+        allowed_pools = [
+            'public_welfare', 'maintain_pool', 'subsidy_pool',
+            'director_pool', 'shop_pool', 'city_pool',
+            'branch_pool', 'fund_pool'
+        ]
+        if pool_type not in allowed_pools:
+            raise FinanceException(f"资金池 {pool_type} 不允许转正操作")
+
+        if amount <= 0:
+            raise FinanceException("转正金额必须大于0")
+
+        from datetime import datetime, timedelta
+        from core.config import COUPON_VALID_DAYS
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 扣除资金池余额并记录支出流水
+                self._add_pool_balance(
+                    cur,
+                    pool_type,
+                    -amount,
+                    remark or f"资金池转正：将{amount:.4f}转为优惠券赠送给用户{user_id}",
+                    related_user=user_id
+                )
+
+                # 2. 发放优惠券
+                today = datetime.now().date()
+                valid_to = today + timedelta(days=COUPON_VALID_DAYS)
+                cur.execute("""
+                    INSERT INTO coupons
+                    (user_id, coupon_type, amount, applicable_product_type, valid_from, valid_to, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'unused')
+                """, (user_id, coupon_type, amount, applicable_product_type, today, valid_to))
+                coupon_id = cur.lastrowid
+
+                # 3. 可选：记录优惠券发放流水（便于查询）
+                cur.execute("""
+                    INSERT INTO account_flow
+                    (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """, ('coupon', user_id, Decimal('0'), Decimal('0'), 'info',
+                      f"通过资金池转正获得优惠券#{coupon_id}，金额{amount:.4f}，来源池:{pool_type}"))
+
+                conn.commit()
+                return coupon_id
+
+    def get_transform_logs(
+            self,
+            pool_type: Optional[str] = None,
+            user_id: Optional[int] = None,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            page: int = 1,
+            page_size: int = 20
+    ) -> Dict[str, Any]:
+        """
+        查询转正操作日志（基于 account_flow）
+        """
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 基础条件：支出流水 + remark 含“转正”
+                where = ["af.flow_type = 'expense'", "af.remark LIKE '%转正%'"]
+                params = []
+
+                if pool_type:
+                    where.append("af.account_type = %s")
+                    params.append(pool_type)
+                if user_id:
+                    where.append("af.related_user = %s")
+                    params.append(user_id)
+                if start_date:
+                    where.append("DATE(af.created_at) >= %s")
+                    params.append(start_date)
+                if end_date:
+                    where.append("DATE(af.created_at) <= %s")
+                    params.append(end_date)
+
+                # 总数
+                count_sql = f"SELECT COUNT(*) as total FROM account_flow af WHERE {' AND '.join(where)}"
+                cur.execute(count_sql, tuple(params))
+                total = cur.fetchone()['total'] or 0
+
+                # 分页明细
+                offset = (page - 1) * page_size
+                sql = f"""
+                    SELECT af.id, af.account_type, af.related_user as user_id, u.name as user_name,
+                           af.change_amount, af.balance_after, af.remark, af.created_at
+                    FROM account_flow af
+                    LEFT JOIN users u ON af.related_user = u.id
+                    WHERE {' AND '.join(where)}
+                    ORDER BY af.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                params.extend([page_size, offset])
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+
+                records = []
+                for r in rows:
+                    records.append({
+                        "log_id": r['id'],
+                        "pool_type": r['account_type'],
+                        "user_id": r['user_id'],
+                        "user_name": r['user_name'],
+                        "amount": abs(float(r['change_amount'])),  # 支出为负数，取绝对值
+                        "balance_after": float(r['balance_after']) if r['balance_after'] else None,
+                        "remark": r['remark'],
+                        "created_at": r['created_at'].strftime("%Y-%m-%d %H:%M:%S")
+                    })
+
+                return {
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "records": records
+                }
 
     # ==================== 2. 查询推荐奖励列表 ====================
     def get_referral_rewards(self, user_id: Optional[int] = None,
@@ -6539,61 +6675,6 @@ class FinanceService:
                     "records": formatted_records,
                     "remark": "整合用户积分(member_points)、商家积分(merchant_points)和公司积分池(company_points)的完整流水明细，grand_total.current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和，current_balance_total为三种积分余额总和"
                 }
-
-# ---------- 新增：公益基金转出 ----------
-    def transfer_from_public_welfare(
-        self,
-        amount: Decimal,
-        target_account: str,
-        remark: str,
-        operator_id: int = 0
-    ) -> bool:
-        """
-        从公益基金账户转出资金（管理员操作）
-        :param amount: 转出金额（元）
-        :param target_account: 目标账户描述（如银行卡号、机构名）
-        :param remark: 转出备注（用途）
-        :param operator_id: 操作人用户ID（管理员）
-        :return: 是否成功
-        """
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # 1. 获取当前余额并加锁（防止并发）
-                cur.execute(
-                    "SELECT balance FROM finance_accounts WHERE account_type = 'public_welfare' FOR UPDATE"
-                )
-                row = cur.fetchone()
-                if not row:
-                    raise FinanceException("公益基金账户不存在")
-                current_balance = Decimal(str(row['balance']))
-
-                if current_balance < amount:
-                    raise InsufficientBalanceException(
-                        "public_welfare",
-                        amount,
-                        current_balance,
-                        "公益基金余额不足"
-                    )
-
-                # 2. 扣减余额
-                new_balance = current_balance - amount
-                cur.execute(
-                    "UPDATE finance_accounts SET balance = %s WHERE account_type = 'public_welfare'",
-                    (new_balance,)
-                )
-
-                # 3. 记录资金流水（支出）
-                cur.execute(
-                    """INSERT INTO account_flow 
-                       (account_type, related_user, change_amount, balance_after, flow_type, remark, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, NOW())""",
-                    ('public_welfare', operator_id, -amount, new_balance, 'expense',
-                     f"公益基金转出至{target_account}，用途：{remark}")
-                )
-
-                conn.commit()
-                logger.info(f"公益基金转出成功: 金额={amount}, 目标={target_account}, 操作人={operator_id}")
-                return True
 
     # ==================== 微信支付商户账户提现到银行卡（自提）功能 ====================
     def merchant_withdraw_to_bankcard(
