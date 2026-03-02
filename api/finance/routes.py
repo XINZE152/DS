@@ -28,14 +28,6 @@ logger = get_logger(__name__)
 # 创建财务系统的路由
 router = APIRouter()
 
-# 定义管理员ID列表（可根据实际修改）
-ADMIN_IDS = [1]  # 假设ID为1的用户是管理员
-
-async def get_current_admin(current_user: Dict = Depends(get_current_user)):
-    if current_user.get('id') not in ADMIN_IDS:
-        raise HTTPException(status_code=403, detail="需要管理员权限")
-    return current_user
-
 def get_finance_service() -> FinanceService:
     """获取 FinanceService 实例（使用统一的 pymysql 连接）"""
     return FinanceService()
@@ -355,49 +347,6 @@ async def get_public_welfare_report(
             data={"summary": report_data['summary'], "details": details}
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-# ---------- 新增：公益基金转出 ----------
-class PublicWelfareTransferRequest(BaseModel):
-    amount: float = Field(..., gt=0, description="转出金额（元）")
-    target_account: str = Field(..., min_length=1, max_length=200, description="目标账户信息")
-    remark: str = Field(..., min_length=1, max_length=500, description="转出用途")
-
-@router.post("/api/public-welfare/transfer", response_model=ResponseModel, summary="公益基金转出（管理员）")
-async def transfer_public_welfare(
-    request: PublicWelfareTransferRequest,
-    admin: Dict = Depends(get_current_admin),
-    service: FinanceService = Depends(get_finance_service)
-):
-    """
-    管理员操作：将公益基金账户的资金转出到指定账户（如银行卡、其他公益机构）。
-    记录详细流水，需确保余额充足。
-    """
-    try:
-        amount = Decimal(str(request.amount))
-        success = service.transfer_from_public_welfare(
-            amount=amount,
-            target_account=request.target_account,
-            remark=request.remark,
-            operator_id=admin['id']
-        )
-        if success:
-            return ResponseModel(
-                success=True,
-                message=f"公益基金转出成功，金额 ¥{request.amount:.2f}",
-                data={
-                    "amount": request.amount,
-                    "target_account": request.target_account,
-                    "remark": request.remark
-                }
-            )
-        else:
-            raise HTTPException(status_code=500, detail="转出失败")
-    except InsufficientBalanceException as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except FinanceException as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"公益基金转出异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1259,6 +1208,77 @@ async def get_all_points_detail_report(
     except Exception as e:
         logger.error(f"查询总积分明细报表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+# 在 merchant_withdraw_to_bankcard 接口之后或适当位置添加
+
+@router.post("/api/fund-pools/transform-to-coupon", response_model=ResponseModel, summary="资金池转正：将池子金额转化为优惠券赠送给用户")
+async def transform_pool_to_coupon(
+    pool_type: str = Query(..., description="资金池类型，如 public_welfare"),
+    user_id: int = Query(..., gt=0, description="接收优惠券的用户ID"),
+    amount: float = Query(..., gt=0, description="转正金额"),
+    coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
+    applicable_product_type: str = Query('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围"),
+    remark: Optional[str] = Query(None, description="操作备注"),
+    service: FinanceService = Depends(get_finance_service)
+):
+    try:
+        coupon_id = service.transform_pool_to_coupon(
+            pool_type=pool_type,
+            user_id=user_id,
+            amount=Decimal(str(amount)),
+            coupon_type=coupon_type,
+            applicable_product_type=applicable_product_type,
+            remark=remark
+        )
+        return ResponseModel(
+            success=True,
+            message=f"转正成功，已为用户{user_id}发放优惠券#{coupon_id}，金额¥{amount:.2f}",
+            data={"coupon_id": coupon_id}
+        )
+    except FinanceException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"转正操作失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/api/fund-pools/transform-logs", response_model=ResponseModel, summary="查询资金池转正操作明细")
+async def get_transform_logs(
+    pool_type: Optional[str] = Query(None, description="资金池类型，不传则查询所有池"),
+    user_id: Optional[int] = Query(None, gt=0, description="接收优惠券的用户ID"),
+    start_date: Optional[str] = Query(None, description="开始日期 yyyy-MM-dd"),
+    end_date: Optional[str] = Query(None, description="结束日期 yyyy-MM-dd"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    service: FinanceService = Depends(get_finance_service)
+):
+    try:
+        data = service.get_transform_logs(
+            pool_type=pool_type,
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size
+        )
+        return ResponseModel(success=True, message="查询成功", data=data)
+    except Exception as e:
+        logger.error(f"查询转正明细失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/api/fund-pools/transform-allowed", response_model=ResponseModel, summary="获取允许转正的资金池列表")
+async def get_transform_allowed_pools():
+    allowed = [
+        {"type": "public_welfare", "name": "公益基金"},
+        {"type": "maintain_pool", "name": "维护池"},
+        {"type": "subsidy_pool", "name": "补贴池"},
+        {"type": "director_pool", "name": "联创奖励池"},
+        {"type": "shop_pool", "name": "店铺池"},
+        {"type": "city_pool", "name": "城市池"},
+        {"type": "branch_pool", "name": "分支池"},
+        {"type": "fund_pool", "name": "资金池"},
+    ]
+    return ResponseModel(success=True, data=allowed)
+
 def register_finance_routes(app: FastAPI):
     """注册财务管理系统路由到主应用"""
     app.include_router(router, tags=["财务系统"])

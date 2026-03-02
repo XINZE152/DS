@@ -109,8 +109,35 @@ async def create_jsapi_order(request: Request):
                 payable_cents -= int(pending_points * Decimal('100'))
                 payable_cents -= int(coupon_amt * Decimal('100'))
 
+                # ==================== 修改点：零元支付处理 ====================
                 if payable_cents <= 0:
-                    raise HTTPException(status_code=400, detail="invalid payable amount")
+                    logger.info(f"订单 {out_trade_no} 应付金额为0，直接完成支付")
+                    try:
+                        # 使用当前连接结算订单
+                        fs = FinanceService()
+                        fs.settle_order(
+                            order_no=out_trade_no,
+                            user_id=order_row['user_id'],
+                            order_id=order_row['id'],
+                            points_to_use=pending_points,
+                            coupon_discount=coupon_amt,
+                            external_conn=conn
+                        )
+                        # settle_order 内部已更新订单状态，无需额外操作
+                        conn.commit()
+
+                        # 返回无需支付的响应
+                        return {
+                            "prepay_id": None,
+                            "need_pay": False,
+                            "message": "订单支付成功（零元支付）",
+                            "order_no": out_trade_no
+                        }
+                    except Exception as e:
+                        conn.rollback()
+                        logger.error(f"零元支付处理失败: {e}", exc_info=True)
+                        raise HTTPException(status_code=500, detail="订单处理失败")
+                # ==================== 修改点结束 ====================
 
                 if total_fee_client_int != payable_cents:
                     logger.warning(
@@ -125,9 +152,8 @@ async def create_jsapi_order(request: Request):
                         )
                         payable_cents = total_fee_client_int
                 total_fee = payable_cents
-            
-        # 到这里无需持有连接，调用微信接口
 
+        # 到这里无需持有连接，调用微信接口
         # 1) 调用微信下单，获取 prepay_id
         try:
             resp = pay_client.create_jsapi_order(
@@ -137,7 +163,7 @@ async def create_jsapi_order(request: Request):
                 description=description
             )
         except Exception as e:
-            # 尝试识别 requests.HTTPError 并提取响应体
+            # 错误处理（原始代码保持不变）
             try:
                 import requests
                 if isinstance(e, requests.exceptions.HTTPError) and hasattr(e, 'response'):
@@ -165,6 +191,7 @@ async def create_jsapi_order(request: Request):
             except Exception:
                 logger.exception("微信下单异常")
                 raise HTTPException(status_code=502, detail=str(e))
+
         prepay_id = resp.get('prepay_id') or resp.get('prepayId')
         if not prepay_id:
             logger.error(f"下单失败，微信返回: {resp}")
