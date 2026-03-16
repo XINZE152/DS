@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 import uvicorn
 import pymysql
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html, get_redoc_html
 from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
@@ -206,6 +206,17 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
+
+# Serve the sensitive txt file contents in plain text
+@app.get("/senIScNn8d.txt", include_in_schema=False)
+async def serve_sen_text():
+    # read and return the file content directly
+    file_path = Path("senIScNn8d.txt")
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except Exception:
+        content = "txtfile error"
+    return Response(content=content, media_type="text/plain")
 
 # 自定义 Swagger UI 页面，启用 filter 参数以支持输入字母快速搜索 API
 @app.get("/docs", include_in_schema=False)

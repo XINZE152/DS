@@ -6,7 +6,7 @@ from typing import Optional, Union, TYPE_CHECKING
 import os
 
 if TYPE_CHECKING:
-    from wechatpayv3 import WeChatPay      # 仅为静态检查服务
+    from wechatpayv3 import WeChatPay  # 仅为静态检查服务
 
 from core.database import get_conn
 from core.config import settings
@@ -16,15 +16,17 @@ from services.notify_service import notify_merchant
 from pathlib import Path
 import pymysql
 import xmltodict
-from services.wechat_api import get_wxacode_unlimit   # ✅ 新增导入
+from services.wechat_api import get_wxacode_unlimit  # ✅ 新增导入
 import base64
 from services.wechat_api import get_wxacode
+# used for plain QR code generation (added to pyproject)
 
 logger = get_logger(__name__)
 
 # -------------- 运行时 wxpay 初始化 --------------
-if not settings.wx_mock_mode_bool:   # ✅ 修改为布尔属性
+if not settings.wx_mock_mode_bool:  # ✅ 修改为布尔属性
     from wechatpayv3 import WeChatPay, WeChatPayType
+
     priv_path = Path(settings.WECHAT_PAY_API_KEY_PATH)
     if not priv_path.exists():
         raise RuntimeError(f"WeChat private key file not found: {priv_path}")
@@ -56,13 +58,13 @@ class OfflineService:
     # ---------- 1. 创建线下支付单 ----------
     @staticmethod
     async def create_order(
-        merchant_id: int,
-        store_name: str,
-        amount: int,
-        product_name: str = "",
-        remark: str = "",
-        invite_code: str = "",
-        user_id: Optional[int] = None,
+            merchant_id: int,
+            store_name: str,
+            amount: int,
+            product_name: str = "",
+            remark: str = "",
+            invite_code: str = "",
+            user_id: Optional[int] = None,
     ) -> dict:
         import uuid
         # 当前登录用户（UUID 字符串）即为商户号
@@ -72,7 +74,7 @@ class OfflineService:
         path = f"pages/offline/pay?orderNo={order_no}&channel=1"
         scene = f"o={order_no}"
         qrcode_b64 = base64.b64encode(await get_wxacode(path=path, scene=scene)).decode()
-        qrcode_url = f"data:image/png;base64,{qrcode_b64}"  
+        qrcode_url = f"data:image/png;base64,{qrcode_b64}"
 
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -105,7 +107,7 @@ class OfflineService:
                     (order_no, current_user_id)
                 )
                 row = cur.fetchone()
-                
+
                 if not row or row["status"] != 1:
                     raise ValueError("订单不存在或状态异常")
                 if row["refresh_count"] >= 1:
@@ -154,9 +156,10 @@ class OfflineService:
                 coupons = svc.list_available(user_id, order["amount"])
                 for c in coupons:
                     c["amount"] = float(c["amount"])
-                    c["threshold"] = float(c["threshold"])
 
         return {**order, "coupons": coupons}
+
+    # services/offline_service.py 中的 unified_order 方法
 
     @staticmethod
     async def unified_order(
@@ -166,11 +169,12 @@ class OfflineService:
             openid: str,
             total_fee: Optional[int] = None,
     ) -> dict:
+        from services.finance_service import FinanceService  # 添加此行
         """total_fee: 单位分，前端传入；当库内金额为 0 或异常时用作兜底传给微信统一下单。"""
         current_user_id = str(user_id)  # 当前登录用户ID（顾客）
 
         # ========== 新增：检查微信支付配置 ==========
-        if settings.wx_mock_mode_bool:   # ✅ 使用布尔属性
+        if settings.wx_mock_mode_bool:  # ✅ 使用布尔属性
             logger.warning("⚠️ 当前处于微信支付 Mock 模式，将返回模拟支付参数")
             logger.warning("⚠️ 如需真实支付，请设置 WX_MOCK_MODE=false 并配置正确的商户信息")
 
@@ -185,7 +189,6 @@ class OfflineService:
                 if not row or row["status"] != 1:
                     raise ValueError("订单不存在或不可支付")
 
-
                 original_amount: int = row["amount"]
                 final_amount = original_amount
                 coupon_discount = 0
@@ -195,19 +198,19 @@ class OfflineService:
                     fs = FinanceService()
                     coupons = fs.get_user_coupons(user_id=user_id, status='unused')
                     target_coupon = next((c for c in coupons if c['id'] == coupon_id), None)
-                    
+
                     if not target_coupon:
                         raise ValueError("优惠券无效或已被使用")
                     if target_coupon.get('applicable_product_type') == 'member_only':
                         raise ValueError("该优惠券仅限会员商品使用")
-                    
+
                     coupon_discount = int(target_coupon['amount'] * 100)
                     if coupon_discount > original_amount:
                         raise ValueError("优惠券金额大于订单金额")
-                    
+
                     final_amount = original_amount - coupon_discount
 
-                # 3. 更新订单：保存优惠券ID和实付金额
+                # 更新实付金额
                 cur.execute(
                     """UPDATE offline_order 
                     SET coupon_id=%s, 
@@ -216,18 +219,74 @@ class OfflineService:
                     WHERE order_no=%s""",
                     (coupon_id, final_amount, order_no)
                 )
+                if cur.rowcount == 0:
+                    logger.error(f"[Offline] 更新订单 {order_no} paid_amount 失败，影响行数为0")
+                    raise ValueError("订单状态异常，无法更新实付金额")
+
+                # 显式提交事务，确保数据持久化
+                conn.commit()
+                logger.info(f"[Offline] 订单 {order_no} 事务已提交")
+
+                # 再次查询更新后的 paid_amount 并记录
+                cur.execute("SELECT paid_amount FROM offline_order WHERE order_no=%s", (order_no,))
+                updated = cur.fetchone()
+                logger.info(
+                    f"[Offline] 订单 {order_no} 提交后 paid_amount={updated['paid_amount'] if updated else None}")
+
+        # ==================== 零元订单处理 ====================
+        if final_amount <= 0:
+            logger.info(f"[Offline] 零元订单，无需支付: {order_no}")
+
+            # ========== 主动核销优惠券（因为无微信回调）==========
+            if coupon_id:
+                try:
+                    from services.finance_service import FinanceService
+                    fs = FinanceService()
+                    fs.use_coupon(
+                        coupon_id=coupon_id,
+                        user_id=user_id,
+                        order_type="normal"
+                    )
+                    logger.info(f"[Offline] 零元订单优惠券核销成功: {coupon_id}")
+                except Exception as e:
+                    # 优惠券核销失败不影响订单完成，但需记录错误人工处理
+                    logger.error(f"[Offline] 零元订单优惠券核销失败（需人工处理）: {e}")
+
+            # 同步调用资金分账和状态更新
+            await OfflineService.on_paid(
+                order_no=order_no,
+                amount=Decimal(final_amount) / 100,  # 转为元
+                coupon_discount=Decimal(coupon_discount) / 100
+            )
+            # 生成模拟支付参数（与线上订单保持一致）
+            import uuid, time
+            pay_params = {
+                "appId": settings.WECHAT_APP_ID,
+                "timeStamp": str(int(time.time())),
+                "nonceStr": uuid.uuid4().hex,
+                "package": "prepay_id=ZERO_ORDER",
+                "signType": "RSA",
+                "paySign": "ZERO_ORDER_SIGN"
+            }
+            return {
+                "pay_params": pay_params,
+                "original_amount": original_amount,
+                "coupon_discount": coupon_discount,
+                "final_amount": final_amount
+            }
+        # ===================================================
 
         # 金额兜底：库内为 0 或异常时用前端传的 total_fee（分），避免微信报「缺少参数 total_fee」
         amount_for_wx = final_amount if final_amount and final_amount > 0 else (total_fee or 0)
         if amount_for_wx <= 0:
             raise ValueError("订单金额异常或未传 total_fee，无法发起支付")
 
-        # 4. 调用微信统一下单
+        # 4. 调用微信统一下单（原有代码保持不变）
         try:
             # ========== 修改：优先使用核心微信支付客户端 ==========
             from core.wx_pay_client import wxpay_client
 
-            if settings.wx_mock_mode_bool:   # ✅ 使用布尔属性
+            if settings.wx_mock_mode_bool:  # ✅ 使用布尔属性
                 # Mock 模式：生成模拟支付参数
                 logger.info(f"[MOCK] 模拟统一下单: order_no={order_no}, amount={amount_for_wx}")
                 prepay_id = f"MOCK_PREPAY_{int(datetime.now().timestamp())}_{user_id}"
@@ -282,18 +341,17 @@ class OfflineService:
             logger.error(f"微信支付调用失败: {e}", exc_info=True)
             raise ValueError(f"支付调用失败: {str(e)}")
 
-    
     # ---------- 5. 订单列表 ----------
     @staticmethod
     async def list_orders(
-        merchant_id: Optional[int] = None, 
-        user_id: Optional[int] = None, 
-        page: int = 1, 
-        size: int = 20
+            merchant_id: Optional[int] = None,
+            user_id: Optional[int] = None,
+            page: int = 1,
+            size: int = 20
     ):
         """
         查询订单列表，支持按商家ID（卖方）或用户ID（买方）查询
-        
+
         Args:
             merchant_id: 商家ID（卖方），与 user_id 互斥
             user_id: 用户ID（买方），与 merchant_id 互斥
@@ -305,9 +363,9 @@ class OfflineService:
             raise ValueError("请传入 merchant_id 或 user_id 其中一个参数")
         if merchant_id and user_id:
             raise ValueError("merchant_id 和 user_id 不能同时传入")
-        
+
         offset = (page - 1) * size
-        
+
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 动态构建查询条件
@@ -321,12 +379,12 @@ class OfflineService:
                     current_user_id = str(user_id)
                     where_clause = "WHERE user_id=%s"
                     params = (current_user_id, size, offset)
-                
+
                 # 查询总数
                 count_sql = f"SELECT COUNT(*) as total FROM offline_order {where_clause}"
                 cur.execute(count_sql, (params[0],))
                 total = cur.fetchone()["total"]
-                
+
                 # 查询分页数据
                 data_sql = (
                     "SELECT order_no,store_name,amount,paid_amount,status,"
@@ -336,16 +394,16 @@ class OfflineService:
                 )
                 cur.execute(data_sql, params)
                 rows = cur.fetchall()
-                
+
                 # 格式化金额（分转元）
                 for row in rows:
                     row["amount_yuan"] = row["amount"] / 100 if row["amount"] else 0
                     row["paid_amount_yuan"] = row["paid_amount"] / 100 if row.get("paid_amount") else 0
                     row["coupon_discount_yuan"] = row["coupon_discount"] / 100 if row.get("coupon_discount") else 0
-        
+
         return {
-            "list": rows, 
-            "page": page, 
+            "list": rows,
+            "page": page,
             "size": size,
             "total": total,
             "total_pages": (total + size - 1) // size
@@ -399,7 +457,6 @@ class OfflineService:
                     return {"status": "expired"}
                 return {"status": "valid"}
 
-
     # ---------- 8. 供优惠券接口调用的原始订单 ----------
     @staticmethod
     async def get_raw_order(order_no: str, merchant_id: str):
@@ -410,20 +467,21 @@ class OfflineService:
                     (order_no, merchant_id)
                 )
                 return cur.fetchone()
-            
+
     @staticmethod
     async def on_paid(order_no: str, amount: Decimal, coupon_discount: Decimal = Decimal(0)):
         """
-        线下订单支付成功后的资金分账（独立简化版）
-        【与线上订单完全隔离，仅处理资金池分配】
+        线下订单支付成功后的处理：
+        - 资金分账（所有子池基于实付+优惠券分配）
+        - 发放用户积分
+        - 增加公司积分池
+        - 通知商家转账
         """
-        from services.finance_service import FinanceService
-        
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 查询订单信息
                 cur.execute(
-                    "SELECT merchant_id, store_name, user_id FROM offline_order WHERE order_no=%s",
+                    "SELECT merchant_id, user_id FROM offline_order WHERE order_no=%s",
                     (order_no,)
                 )
                 order = cur.fetchone()
@@ -431,56 +489,86 @@ class OfflineService:
                     logger.error(f"[on_paid] 订单不存在: {order_no}")
                     return
 
-                # 1️⃣ 插入平台订单表（仅用于财务对账，status=completed 表示直接完成）
-                # （如果不需要对账可删除此段）
+                merchant_id = order["merchant_id"]
+                user_id = order["user_id"]
+
+                # 1. 插入平台订单表（用于对账）
                 cur.execute(
                     """INSERT INTO orders (order_number, user_id, merchant_id, total_amount, status,
-                    offline_order_flag, pay_way, created_at, coupon_discount) 
-                    VALUES (%s, %s, %s, %s, 'completed', 1, 'wechat', NOW(), %s)""",
-                    (order_no, order["user_id"], order["merchant_id"], amount, coupon_discount)
+                       offline_order_flag, pay_way, created_at, coupon_discount) 
+                       VALUES (%s, %s, %s, %s, 'completed', 1, 'wechat', NOW(), %s)""",
+                    (order_no, user_id, merchant_id, amount, coupon_discount)
                 )
-                
-                # 2️⃣ 资金分账（简化版：只分池子，不发奖励）
+
+                # 2. 资金分账
                 finance = FinanceService()
                 allocs = finance.get_pool_allocations()
                 merchant_ratio = allocs.get('merchant_balance', Decimal('0.80'))
-                merchant_amount = amount * merchant_ratio
-                
-                # 平台收入池记账（100%）
+
+                # ✅ 统一基数 = 实付金额 + 优惠券金额
+                distribution_base = amount + coupon_discount
+
+                merchant_amount = distribution_base * merchant_ratio  # 商家应得总额（含优惠券）
+
+                # 平台收入池记录完整收入
                 finance._add_pool_balance(
-                    cur, 'platform_revenue_pool', amount,
-                    f"线下订单收入: {order_no}", order["merchant_id"]
+                    cur, 'platform_revenue_pool', distribution_base,
+                    f"线下订单收入: {order_no}", merchant_id
                 )
-                
-                # 各子池分配（20%）
+
+                # 从平台收入池分配各子池（公益基金、维护池、补贴池等）
                 for pool_type, ratio in allocs.items():
                     if pool_type == 'merchant_balance' or ratio <= 0:
                         continue
-                    alloc_amount = amount * ratio
-                    # 从平台池扣减
+                    alloc_amount = distribution_base * ratio
                     finance._add_pool_balance(
                         cur, 'platform_revenue_pool', -alloc_amount,
-                        f"线下订单分配: {order_no} -> {pool_type}", order["merchant_id"]
+                        f"线下订单分配: {order_no} -> {pool_type}", merchant_id
                     )
-                    # 子池增加
                     finance._add_pool_balance(
                         cur, pool_type, alloc_amount,
-                        f"线下订单收入: {order_no}", order["merchant_id"]
+                        f"线下订单收入: {order_no}", merchant_id
                     )
-                
-                conn.commit()
-            
-            # 3️⃣ 商户实时到账（调用已有逻辑）
-            # 注意：这里转的是扣除平台抽成后的金额
-            await notify_merchant(
-                merchant_id=order["merchant_id"],
-                order_no=order_no,
-                amount=int(merchant_amount * 100)  # 转为分
-            )
-            
-            logger.info(f"[on_paid] 线下订单完成: {order_no}, 金额: {amount}, 商户实收: {merchant_amount}")
 
-# ==================== 新增：生成永久收款码 ====================
+                # 3. 用户积分发放（实付部分）
+                if amount > 0 and user_id is not None:
+                    cur.execute(
+                        "UPDATE users SET member_points = COALESCE(member_points, 0) + %s WHERE id = %s",
+                        (amount, user_id)
+                    )
+                    cur.execute("SELECT member_points FROM users WHERE id = %s", (user_id,))
+                    new_balance = cur.fetchone()["member_points"]
+                    cur.execute(
+                        """INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+                           VALUES (%s, %s, %s, 'member', %s, %s, NOW())""",
+                        (user_id, amount, new_balance, f"线下订单支付获得积分: {order_no}", None)
+                    )
+
+                # 4. 公司积分池增加（基于完整基数）
+                platform_points_amount = distribution_base * Decimal('0.20')
+                if platform_points_amount > 0:
+                    finance._add_pool_balance(
+                        cur, 'company_points', platform_points_amount,
+                        f"线下订单平台积分: {order_no}", None
+                    )
+
+                # ===== 新增：从平台收入池扣除商家应得金额 =====
+                finance._add_pool_balance(
+                    cur, 'platform_revenue_pool', -merchant_amount,
+                    f"线下订单商家结算: {order_no}", merchant_id
+                )
+
+                conn.commit()
+
+        # 5. 异步通知商家转账（转账金额基于完整基数）
+        if merchant_amount > 0:
+            await notify_merchant(
+                merchant_id=merchant_id,
+                order_no=order_no,
+                amount=int(merchant_amount * 100)  # 转换为分
+            )
+
+    # ==================== 新增：生成永久收款码 ====================
     @staticmethod
     async def generate_permanent_qrcode(merchant_id: int) -> dict:
         """
@@ -560,25 +648,44 @@ class OfflineService:
             # 普通可访问链接（方便生成传统二维码或进行域名验证）
             base = getattr(settings, 'HOST', '').rstrip('/')
             if base:
-                normal_url = f"{base}/offline/permanentPay?merchant_id={merchant_id}"
+                web_url = f"{base}/offline?id={merchant_id}"
+                universal_url = f"{base}/offline/permanentPay?merchant_id={merchant_id}"
             else:
                 # 如果 HOST 未配置，则返回相对路径；前端/扫码页面应当补全域名
-                normal_url = f"/offline/permanentPay?merchant_id={merchant_id}"
+                web_url = f"/offline?id={merchant_id}"
+                universal_url = f"/offline/permanentPay?merchant_id={merchant_id}"
+
+            # ===== 生成普通二维码图片 =====
+            normal_qrcode_data_url = None
+            try:
+                import qrcode, io
+                qr_img = qrcode.make(web_url)
+                buf = io.BytesIO()
+                qr_img.save(buf, format="PNG")
+                normal_qrcode_b64 = base64.b64encode(buf.getvalue()).decode()
+                normal_qrcode_data_url = f"data:image/png;base64,{normal_qrcode_b64}"
+            except Exception as e:
+                logger.warning(f"生成普通二维码失败: {e}")
+            # =================================
 
             return {
-                "qrcode": qrcode_data_url,
-                "url": normal_url,             # 🎯 新增字段，供前端生成普通二维码
+                "qrcode": qrcode_data_url,                  # 小程序码 / 太阳码
+                "url": web_url,                             # 传统二维码指向的页面
+                "universal_link": universal_url,           # 兼容旧客户端/描述
+                "plain_qrcode": normal_qrcode_data_url,    # base64 PNG 普通二维码
                 "expire_at": None,  # 永久有效
                 "merchant_id": merchant_id
             }
         except Exception as e:
             logger.error(f"生成商户{merchant_id}永久二维码失败: {e}", exc_info=True)
             raise
+
     # ==============================================================
 
-# ==================== 新增：用户创建订单（永久码场景） ====================
+    # ==================== 新增：用户创建订单（永久码场景） ====================
     @staticmethod
-    async def create_order_for_user(merchant_id: int, user_id: int, amount: int, coupon_id: Optional[int] = None) -> str:
+    async def create_order_for_user(merchant_id: int, user_id: int, amount: int,
+                                    coupon_id: Optional[int] = None) -> str:
         """
         创建订单（不生成二维码），用于永久码场景。
         :param merchant_id: 商家ID
