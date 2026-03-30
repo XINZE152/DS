@@ -5,8 +5,10 @@ import sys
 from pathlib import Path
 import uvicorn
 import pymysql
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html, get_redoc_html
+from fastapi.responses import HTMLResponse, FileResponse
+import re
 from core.json_response import DecimalJSONResponse, register_exception_handlers
 from fastapi.staticfiles import StaticFiles
 from core.middleware import setup_cors, setup_static_files
@@ -14,6 +16,7 @@ from core.config import get_db_config, PIC_PATH, AVATAR_UPLOAD_DIR,UVICORN_PORT
 from core.logging import setup_logging
 from database_setup import initialize_database
 from api.wechat_pay.routes import register_wechat_pay_routes
+from api.wechat_wxa.routes import register_wechat_wxa_routes
 from core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,7 +38,7 @@ from api.store_setup.routes import register_store_routes
 # 删除或注释掉旧的导入：from api.user.bankcard_routes import register_bankcard_routes
 # 新增导入：
 from api.bankcard.routes import register_bankcard_routes
-from api.offline.routes import register_offline_routes
+from api.offline.routes import register_offline_routes, pay_bridge_router
 
 def ensure_database():
     """确保数据库存在"""
@@ -61,8 +64,8 @@ def ensure_database():
 
 # 创建统一的 FastAPI 应用实例
 app = FastAPI(
-    title="综合管理系统API",
-    description="财务管理系统 + 用户中心 + 订单系统 + 商品管理",
+    title="禹泽数字科技综合管理系统API",
+    description="本网站为企业综合管理系统接口服务平台，用于提供用户管理、订单管理、商品管理及数据统计等系统功能。",
     version="1.0.0",
     docs_url="/docs",  # 自定义 docs 路由以支持搜索过滤
     redoc_url="/redoc",  # ReDoc 文档地址
@@ -136,6 +139,10 @@ tags_metadata = [
         "name": "微信支付",
         "description": "微信支付相关接口，包括支付回调、订单查询等功能。",
     },
+    {
+        "name": "微信小程序",
+        "description": "小程序服务器消息推送（发货管理事件等），与支付回调 URL 独立配置。",
+    },
     # ============================================================
     {
         "name": "银行卡管理",
@@ -156,10 +163,39 @@ app.openapi_tags = tags_metadata
 app.mount("/pic/avatars", StaticFiles(directory=str(AVATAR_UPLOAD_DIR)), name="avatars")
 app.mount("/pic", StaticFiles(directory=str(PIC_PATH)), name="pic")
 
-# 挂载一个专用的 ``/offline`` 静态目录
-# 用于放置微信小程序域名/支付二维码验证文件，外部普通二维码也可指向该路径。
+# 挂载 ``/offline`` 静态目录（子路径如 /offline/xxx.txt；精确路径 /offline?id= 由 pay_bridge_router 处理）
+# 用于放置微信小程序域名校验等文件。
 offline_static_dir = Path("offline")
 offline_static_dir.mkdir(exist_ok=True)
+_APP_ROOT = Path(__file__).resolve().parent
+
+
+def _domain_verify_txt_response(filename: str) -> FileResponse:
+    """域名校验文件：依次查找项目根目录、offline/（与 StaticFiles 挂载一致）。"""
+    for p in (_APP_ROOT / filename, offline_static_dir / filename):
+        if p.is_file():
+            return FileResponse(str(p), media_type="text/plain; charset=utf-8")
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+@app.get("/senIScNn8d.txt", include_in_schema=False)
+async def wechat_mp_domain_verify_txt():
+    """
+    微信校验常要求访问 https://域名/senIScNn8d.txt。
+    依次查找：项目根目录（与历史部署一致）、offline/（与静态挂载一致）。
+    """
+    return _domain_verify_txt_response("senIScNn8d.txt")
+
+
+@app.get("/52c061f087c7465664f22c9344178416.txt", include_in_schema=False)
+async def wechat_mp_domain_verify_52c061f_txt():
+    """业务域名校验等由平台生成的根路径文件名；文件可放在项目根或 offline/。"""
+    return _domain_verify_txt_response("52c061f087c7465664f22c9344178416.txt")
+
+
+# /offline?id= 永久收款 H5 落地（pay_bridge_router）必须优先于下方 StaticFiles，否则无法匹配
+app.include_router(pay_bridge_router)
+
 app.mount("/offline", StaticFiles(directory=str(offline_static_dir)), name="offline_static")
 
 # 添加 CORS 中间件和静态文件（统一配置）pic_path
@@ -174,6 +210,7 @@ register_product_routes(app)
 register_system_routes(app)
 register_wechat_applyment_routes(app)  # 添加这一行
 register_wechat_pay_routes(app)
+register_wechat_wxa_routes(app)
 register_store_routes(app)
 register_bankcard_routes(app) # 修改：注册新的银行卡路由
 register_offline_routes(app)
@@ -218,24 +255,53 @@ app.openapi = custom_openapi
 
 
 # Serve the sensitive txt file contents in plain text
-@app.get("/senIScNn8d.txt", include_in_schema=False)
-async def serve_sen_text():
-    # read and return the file content directly
-    file_path = Path("senIScNn8d.txt")
-    try:
-        content = file_path.read_text(encoding="utf-8")
-    except Exception:
-        content = "txtfile error"
-    return Response(content=content, media_type="text/plain")
-
-# 自定义 Swagger UI 页面，启用 filter 参数以支持输入字母快速搜索 API
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html():
-    return get_swagger_ui_html(
-        openapi_url=app.openapi_url,
-        title=f"{app.title} - Swagger UI",
-        swagger_ui_parameters={"filter": True}
-    )
+    try:
+        # 获取原始 Swagger UI HTML
+        swagger_html = get_swagger_ui_html(
+            openapi_url=app.openapi_url,
+            title=f"{app.title} - Swagger UI",
+            swagger_ui_parameters={"filter": True}
+        )
+        # 确保 body 存在
+        if not swagger_html.body:
+            raise ValueError("Swagger UI HTML body is empty")
+        original_html = swagger_html.body.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Failed to get Swagger UI HTML: {e}", exc_info=True)
+        # 出错时返回原始响应（不带备案号），保证页面正常显示
+        return get_swagger_ui_html(
+            openapi_url=app.openapi_url,
+            title=f"{app.title} - Swagger UI",
+            swagger_ui_parameters={"filter": True}
+        )
+
+    beian_html = """
+    <div style="
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        text-align: center;
+        font-size: 12px;
+        color: #666;
+        background: rgba(255,255,255,0.95);
+        padding: 8px;
+        z-index: 10000;
+        border-top: 1px solid #e2e2e2;
+    ">
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">
+            鄂ICP备2026001452号
+        </a>
+    </div>
+    """
+
+    # 不区分大小写替换 </body>
+    original_html = re.sub(r'</body>', beian_html + '</body>', original_html, flags=re.IGNORECASE)
+
+    logger.info("Injected beian HTML into /docs")
+    return HTMLResponse(content=original_html, media_type="text/html")
 
 
 # Swagger UI oauth2 redirect 支持

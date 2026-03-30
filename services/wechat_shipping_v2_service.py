@@ -92,24 +92,46 @@ class WechatShippingService:
         logger.info(f"调用微信发货信息录入接口: transaction_id={transaction_id}")
         return self._request("/upload_shipping_info", payload)
 
-    def notify_confirm_receive(self, transaction_id: str, received_time: int) -> dict:
+    def set_msg_jump_path(self, path: str) -> dict:
+        """设置发货/确认收货消息点击后跳转的小程序页面路径（需已接入官方确认收货组件）。"""
+        payload = {"path": (path or "").strip()}
+        logger.info("调用微信 set_msg_jump_path: path=%s", payload["path"])
+        return self._request("/set_msg_jump_path", payload)
+
+    def notify_confirm_receive(
+        self,
+        transaction_id: str,
+        received_time: int,
+        merchant_id: str | None = None,
+        merchant_trade_no: str | None = None,
+    ) -> dict:
         """
         确认收货提醒接口
         :param transaction_id: 微信支付单号
         :param received_time: 快递签收时间 (unix时间戳)
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "transaction_id": transaction_id,
-            "received_time": received_time
+            "received_time": received_time,
         }
+        if merchant_id:
+            payload["merchant_id"] = merchant_id
+        if merchant_trade_no:
+            payload["merchant_trade_no"] = merchant_trade_no
         logger.info(f"调用微信确认收货提醒接口: transaction_id={transaction_id}")
         return self._request("/notify_confirm_receive", payload)
 
-    def get_order(self, transaction_id: str) -> dict:
-        """查询订单发货状态"""
+    def get_order_response(self, transaction_id: str) -> dict:
+        """查询订单发货状态（完整接口返回，含 errcode）"""
         payload = {"transaction_id": transaction_id}
-        result = self._request("/get_order", payload)
-        return result.get("order", {})
+        return self._request("/get_order", payload)
+
+    def get_order(self, transaction_id: str) -> dict:
+        """查询订单发货状态（仅 order 对象；失败时返回空 dict）"""
+        result = self.get_order_response(transaction_id)
+        if result.get("errcode") != 0:
+            return {}
+        return result.get("order") or {}
 
     def get_order_list(self, openid: Optional[str] = None, order_state: Optional[int] = None,
                        begin_time: Optional[int] = None, end_time: Optional[int] = None,

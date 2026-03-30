@@ -2,8 +2,9 @@
 from __future__ import annotations
 from decimal import Decimal
 from datetime import datetime, timedelta
-from typing import Optional, Union, TYPE_CHECKING
+from typing import Optional, Union, TYPE_CHECKING, Any
 import os
+import json
 
 if TYPE_CHECKING:
     from wechatpayv3 import WeChatPay  # 仅为静态检查服务
@@ -162,14 +163,28 @@ class OfflineService:
     # services/offline_service.py 中的 unified_order 方法
 
     @staticmethod
+    def _merge_offline_coupon_ids(
+        coupon_ids: Optional[list[int]] = None,
+        coupon_id: Optional[int] = None,
+    ) -> list[int]:
+        ids: list[int] = []
+        if coupon_ids:
+            ids.extend(int(x) for x in coupon_ids if x is not None)
+        if coupon_id is not None and int(coupon_id) != 0:
+            ids.append(int(coupon_id))
+        # 去重 + 稳定排序（便于日志/对账）
+        return sorted({i for i in ids if i > 0})
+
+    @staticmethod
     async def unified_order(
             order_no: str,
             coupon_id: Optional[int],
             user_id: int,
             openid: str,
             total_fee: Optional[int] = None,
+            coupon_ids: Optional[list[int]] = None,
     ) -> dict:
-        from services.finance_service import FinanceService  # 添加此行
+        from services.finance_service import FinanceService, max_coupon_total_yuan  # 添加此行
         """total_fee: 单位分，前端传入；当库内金额为 0 或异常时用作兜底传给微信统一下单。"""
         current_user_id = str(user_id)  # 当前登录用户ID（顾客）
 
@@ -192,32 +207,48 @@ class OfflineService:
                 original_amount: int = row["amount"]
                 final_amount = original_amount
                 coupon_discount = 0
+                target_coupon_ids = OfflineService._merge_offline_coupon_ids(
+                    coupon_ids=coupon_ids,
+                    coupon_id=coupon_id,
+                )
 
-                # 2. 验证并应用优惠券
-                if coupon_id:
+                # 2. 验证并应用优惠券（支持多张叠加）
+                if target_coupon_ids:
                     fs = FinanceService()
                     coupons = fs.get_user_coupons(user_id=user_id, status='unused')
-                    target_coupon = next((c for c in coupons if c['id'] == coupon_id), None)
+                    coupon_by_id = {int(c["id"]): c for c in coupons}
 
-                    if not target_coupon:
-                        raise ValueError("优惠券无效或已被使用")
-                    if target_coupon.get('applicable_product_type') == 'member_only':
-                        raise ValueError("该优惠券仅限会员商品使用")
+                    total_discount = 0
+                    for cid in target_coupon_ids:
+                        c = coupon_by_id.get(int(cid))
+                        if not c:
+                            raise ValueError(f"优惠券无效或已被使用: {cid}")
+                        if c.get("applicable_product_type") == "member_only":
+                            raise ValueError("该优惠券仅限会员商品使用")
+                        total_discount += int(Decimal(str(c["amount"])) * 100)
 
-                    coupon_discount = int(target_coupon['amount'] * 100)
-                    if coupon_discount > original_amount:
-                        raise ValueError("优惠券金额大于订单金额")
+                    # 与线上一致：券叠加上限 = ceil(商品金额) 到元；实际抵扣封顶到订单金额（见 cap_discounts_to_merchandise_total）
+                    merchandise_yuan = (Decimal(original_amount) / Decimal(100)).quantize(Decimal("0.01"))
+                    max_coupon_yuan = max_coupon_total_yuan(merchandise_yuan, Decimal("0"))
+                    max_coupon_fen = int(max_coupon_yuan * Decimal(100))
+                    if total_discount > max_coupon_fen:
+                        raise ValueError("优惠券合计抵扣超过允许上限")
 
+                    coupon_discount = min(total_discount, original_amount)
                     final_amount = original_amount - coupon_discount
 
                 # 更新实付金额
+                coupon_ids_json = json.dumps(target_coupon_ids) if target_coupon_ids else None
+                primary_coupon_id = target_coupon_ids[0] if target_coupon_ids else None
                 cur.execute(
                     """UPDATE offline_order 
-                    SET coupon_id=%s, 
+                    SET coupon_id=%s,
+                        coupon_ids=%s,
+                        coupon_discount=%s,
                         paid_amount=%s,
                         updated_at=NOW()
                     WHERE order_no=%s""",
-                    (coupon_id, final_amount, order_no)
+                    (primary_coupon_id, coupon_ids_json, coupon_discount, final_amount, order_no)
                 )
                 if cur.rowcount == 0:
                     logger.error(f"[Offline] 更新订单 {order_no} paid_amount 失败，影响行数为0")
@@ -238,22 +269,27 @@ class OfflineService:
             logger.info(f"[Offline] 零元订单，无需支付: {order_no}")
 
             # ========== 主动核销优惠券（因为无微信回调）==========
-            if coupon_id:
+            zero_coupon_ids = OfflineService._merge_offline_coupon_ids(
+                coupon_ids=coupon_ids,
+                coupon_id=coupon_id,
+            )
+            if zero_coupon_ids:
                 try:
                     from services.finance_service import FinanceService
                     fs = FinanceService()
-                    fs.use_coupon(
-                        coupon_id=coupon_id,
-                        user_id=user_id,
-                        order_type="normal"
-                    )
-                    logger.info(f"[Offline] 零元订单优惠券核销成功: {coupon_id}")
+                    for cid in zero_coupon_ids:
+                        fs.use_coupon(
+                            coupon_id=int(cid),
+                            user_id=user_id,
+                            order_type="normal"
+                        )
+                    logger.info(f"[Offline] 零元订单优惠券核销成功: {zero_coupon_ids}")
                 except Exception as e:
                     # 优惠券核销失败不影响订单完成，但需记录错误人工处理
                     logger.error(f"[Offline] 零元订单优惠券核销失败（需人工处理）: {e}")
 
             # 同步调用资金分账和状态更新
-            await OfflineService.on_paid(
+            transfer_warn = await OfflineService.on_paid(
                 order_no=order_no,
                 amount=Decimal(final_amount) / 100,  # 转为元
                 coupon_discount=Decimal(coupon_discount) / 100
@@ -268,12 +304,15 @@ class OfflineService:
                 "signType": "RSA",
                 "paySign": "ZERO_ORDER_SIGN"
             }
-            return {
+            out_zero: dict[str, Any] = {
                 "pay_params": pay_params,
                 "original_amount": original_amount,
                 "coupon_discount": coupon_discount,
                 "final_amount": final_amount
             }
+            if transfer_warn:
+                out_zero["merchant_transfer_warning"] = transfer_warn
+            return out_zero
         # ===================================================
 
         # 金额兜底：库内为 0 或异常时用前端传的 total_fee（分），避免微信报「缺少参数 total_fee」
@@ -469,13 +508,16 @@ class OfflineService:
                 return cur.fetchone()
 
     @staticmethod
-    async def on_paid(order_no: str, amount: Decimal, coupon_discount: Decimal = Decimal(0)):
+    async def on_paid(order_no: str, amount: Decimal, coupon_discount: Decimal = Decimal(0)) -> Optional[str]:
         """
         线下订单支付成功后的处理：
         - 资金分账（所有子池基于实付+优惠券分配）
         - 发放用户积分
         - 增加公司积分池
         - 通知商家转账
+
+        若微信「商家转账」失败（如 SIGN_ERROR），仅记录日志并返回告警文案，不抛异常，
+        避免零元单已核销优惠券后接口仍返回 400。
         """
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
@@ -487,7 +529,7 @@ class OfflineService:
                 order = cur.fetchone()
                 if not order:
                     logger.error(f"[on_paid] 订单不存在: {order_no}")
-                    return
+                    return None
 
                 merchant_id = order["merchant_id"]
                 user_id = order["user_id"]
@@ -562,11 +604,31 @@ class OfflineService:
 
         # 5. 异步通知商家转账（转账金额基于完整基数）
         if merchant_amount > 0:
-            await notify_merchant(
-                merchant_id=merchant_id,
-                order_no=order_no,
-                amount=int(merchant_amount * 100)  # 转换为分
-            )
+            try:
+                await notify_merchant(
+                    merchant_id=merchant_id,
+                    order_no=order_no,
+                    amount=int(merchant_amount * 100)  # 转换为分
+                )
+            except Exception as e:
+                msg = str(e)
+                logger.error(
+                    f"[on_paid] 商家转账失败（订单已分账入库，需人工核对/修证书） order={order_no}: {msg}",
+                    exc_info=True,
+                )
+                return msg
+        return None
+
+    @staticmethod
+    def is_valid_offline_permanent_pay_target(merchant_user_id: int) -> bool:
+        """永久收款外链中的 id 须为已开通商户身份的用户（is_merchant>=1）。"""
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM users WHERE id = %s AND COALESCE(is_merchant, 0) >= 1 LIMIT 1",
+                    (merchant_user_id,),
+                )
+                return cur.fetchone() is not None
 
     # ==================== 新增：生成永久收款码 ====================
     @staticmethod
@@ -645,15 +707,14 @@ class OfflineService:
                         )
                     conn.commit()
 
-            # 普通可访问链接（方便生成传统二维码或进行域名验证）
-            base = getattr(settings, 'HOST', '').rstrip('/')
+            # 普通可访问链接（HOST 或从 WECHAT_PAY_NOTIFY_URL 推断公开域名）
+            base = settings.public_base_url
             if base:
-                web_url = f"{base}/offline?id={merchant_id}"
-                universal_url = f"{base}/offline/permanentPay?merchant_id={merchant_id}"
+                universal_url = f"{base}/offline?id={merchant_id}"
             else:
-                # 如果 HOST 未配置，则返回相对路径；前端/扫码页面应当补全域名
-                web_url = f"/offline?id={merchant_id}"
-                universal_url = f"/offline/permanentPay?merchant_id={merchant_id}"
+                universal_url = f"/offline?id={merchant_id}"
+            # 与 universal 一致：普通二维码指向 /offline?id=（H5 拉起小程序）
+            web_url = universal_url
 
             # ===== 生成普通二维码图片 =====
             normal_qrcode_data_url = None
@@ -685,13 +746,15 @@ class OfflineService:
     # ==================== 新增：用户创建订单（永久码场景） ====================
     @staticmethod
     async def create_order_for_user(merchant_id: int, user_id: int, amount: int,
-                                    coupon_id: Optional[int] = None) -> str:
+                                    coupon_id: Optional[int] = None,
+                                    coupon_ids: Optional[list[int]] = None) -> str:
         """
         创建订单（不生成二维码），用于永久码场景。
         :param merchant_id: 商家ID
         :param user_id: 用户ID
         :param amount: 订单金额（分）
-        :param coupon_id: 优惠券ID（可选）
+        :param coupon_id: 优惠券ID（可选，兼容单券）
+        :param coupon_ids: 多张优惠券ID（可选）
         :return: 订单号
         """
         import uuid
@@ -705,14 +768,17 @@ class OfflineService:
                     store_name = row['store_name']
         # ------------------------------
         order_no = f"OFF{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:6]}"
+        merged = OfflineService._merge_offline_coupon_ids(coupon_ids=coupon_ids, coupon_id=coupon_id)
+        primary = merged[0] if merged else None
+        coupon_ids_json = json.dumps(merged) if merged else None
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # 插入订单，状态为待支付（1）
                 cur.execute("""
                     INSERT INTO offline_order
-                    (order_no, merchant_id, user_id, amount, coupon_id, store_name, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, 1)
-                """, (order_no, merchant_id, user_id, amount, coupon_id, store_name))
+                    (order_no, merchant_id, user_id, amount, coupon_id, coupon_ids, store_name, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                """, (order_no, merchant_id, user_id, amount, primary, coupon_ids_json, store_name))
                 conn.commit()
         return order_no
     # ==============================================================

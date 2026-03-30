@@ -178,6 +178,7 @@ class DatabaseManager:
                     wechat_shipping_retry_count TINYINT NOT NULL DEFAULT 0 COMMENT '微信发货重试次数，最多1次',
                     pending_points DECIMAL(12,4) DEFAULT NULL,           -- 确保有这行（或让自动添加机制处理）
                     pending_coupon_id BIGINT UNSIGNED DEFAULT NULL,      -- 确保有这行（或让自动添加机制处理）
+                    pending_coupon_ids JSON NULL COMMENT '下单时选择的多张优惠券ID列表',
                     coupon_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000, -- 确保有这行
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -225,6 +226,7 @@ class DatabaseManager:
                     store_name          VARCHAR(100) NOT NULL COMMENT '门店名称',
                     amount              INT NOT NULL COMMENT '订单金额（单位：分）',
                     coupon_id           INT NULL COMMENT '使用的优惠券ID',           
+                    coupon_ids          JSON NULL COMMENT '使用的多张优惠券ID列表(JSON数组)',
                     coupon_discount     INT DEFAULT 0 COMMENT '优惠券抵扣金额（分）', 
                     paid_amount         INT DEFAULT 0 COMMENT '实付金额（分，优惠后）',
                     product_name        VARCHAR(255) DEFAULT '' COMMENT '商品名称',
@@ -863,6 +865,7 @@ class DatabaseManager:
                 # 新增字段：积分和优惠券相关
                 'pending_points': 'pending_points DECIMAL(12,4) DEFAULT NULL COMMENT \'下单时选择的积分抵扣数量（支付前临时存储）\'',
                 'pending_coupon_id': 'pending_coupon_id BIGINT UNSIGNED DEFAULT NULL COMMENT \'下单时选择的优惠券ID（支付前临时存储）\'',
+                'pending_coupon_ids': 'pending_coupon_ids JSON NULL COMMENT \'下单时多张优惠券ID列表(JSON数组)\'',
                 'coupon_discount': 'coupon_discount DECIMAL(12,4) NOT NULL DEFAULT 0.0000 COMMENT \'优惠券抵扣金额（支付后写入）\'',
                 'original_amount': 'original_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT \'订单原始金额（优惠前）\'',
                 # ⬇️ 新增字段
@@ -909,6 +912,7 @@ class DatabaseManager:
             },
             'offline_order': {
                 'coupon_id': "coupon_id INT NULL COMMENT '使用的优惠券ID'",
+                'coupon_ids': "coupon_ids JSON NULL COMMENT '使用的多张优惠券ID列表(JSON数组)'",
                 'coupon_discount': "coupon_discount INT DEFAULT 0 COMMENT '优惠券抵扣金额（分）'",
                 'paid_amount': "paid_amount INT DEFAULT 0 COMMENT '实付金额（分，优惠后）'",
                 'user_id': "user_id BIGINT UNSIGNED NULL COMMENT '付款用户ID（可空）'",

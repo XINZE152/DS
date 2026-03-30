@@ -390,16 +390,22 @@ def get_all_products(
 
 @router.get("/products/home", summary="🏠 获取首页推荐商品列表")
 def get_home_products():
-    # 公开接口
+    """
+    获取首页商品列表
+    - 会员商品（is_member_product=1）无条件展示
+    - 普通商品（is_member_product=0）仅展示被推荐（is_home_recommend=1）的商品
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # 修改查询条件：会员商品 OR 推荐商品
             select_sql = build_dynamic_select(
                 cur,
                 "products",
-                where_clause="is_home_recommend = 1",
-                order_by="id DESC"  # 可按需调整排序规则，例如按创建时间倒序
+                where_clause="is_member_product = 1 OR is_home_recommend = 1",
+                order_by="CASE WHEN is_member_product = 1 THEN 1 ELSE 2 END, id DESC"
             )
             cur.execute(select_sql)
+            ...
             products = cur.fetchall()
 
             result_data = []

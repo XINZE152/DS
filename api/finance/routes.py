@@ -634,27 +634,40 @@ async def set_pool_allocations(
 
 
 # ==================== 1. 优惠券发放接口 ====================
-# 在优惠券发放接口中添加 applicable_product_type 参数
-@router.post("/api/coupons/distribute", response_model=ResponseModel, summary="直接发放优惠券")
+@router.post("/api/coupons/distribute", response_model=ResponseModel, summary="为指定用户发放1元优惠券")
 async def distribute_coupon(
     user_id: int = Query(..., gt=0, description="用户ID"),
-    amount: float = Query(..., gt=0, description="优惠券金额"),
+    amount: float = Query(
+        ...,
+        gt=0,
+        description="发放张数（沿用参数名 amount；每张固定 1 元，例如 amount=5 发 5 张）",
+    ),
     coupon_type: str = Query('user', pattern=r'^(user|merchant)$', description="优惠券类型"),
-    applicable_product_type: str = Query('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品"),  # 新增参数
+    applicable_product_type: str = Query('all', pattern=r'^(all|normal_only|member_only)$', description="适用商品范围：all=不限制，normal_only=仅普通商品，member_only=仅会员商品"),
     service: FinanceService = Depends(get_finance_service)
 ):
-    """直接给用户发放优惠券，需扣除等额的 true_total_points（1:1）"""
+    """为指定用户发放 n 张 1 元优惠券，按张扣除 true_total_points（每张 1:1）。查询参数 amount 表示张数。"""
+    n = int(amount)
+    if n < 1:
+        raise HTTPException(status_code=422, detail="amount（张数）须为至少 1 的整数")
     try:
-        coupon_id = service.distribute_coupon_directly(
+        coupon_ids = service.distribute_n_one_yuan_coupons(
             user_id,
-            amount,
+            n,
             coupon_type,
-            applicable_product_type  # 传递新参数
+            applicable_product_type,
         )
+        total = float(n)
         return ResponseModel(
             success=True,
-            message=f"优惠券发放成功（已扣除 true_total_points ¥{amount:.4f}）",
-            data={"coupon_id": coupon_id, "amount": amount, "applicable_product_type": applicable_product_type}
+            message=f"已发放 {n} 张 1 元优惠券（已扣除 true_total_points ¥{total:.4f}）",
+            data={
+                "coupon_ids": coupon_ids,
+                "count": n,
+                "amount_per_coupon": 1.0,
+                "total_amount": total,
+                "applicable_product_type": applicable_product_type,
+            },
         )
     except FinanceException as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -703,14 +716,17 @@ async def distribute_coupons_batch(
 
 @router.post("/api/coupons/exchange", response_model=ResponseModel, summary="雨点兑换优惠券（平台批量发放）")
 async def exchange_coupons(
+    count: Optional[int] = Query(None, gt=0, description="每个用户发放的优惠券数量，不传则按雨点余额全量兑换（受系统上限限制）"),
     service: FinanceService = Depends(get_finance_service)
 ):
     """
-    平台接口：自动为所有有雨点（true_total_points > 0）的用户发放1元优惠券。
-    发放数量 = min(floor(雨点余额), 平台设定的上限)
+    平台接口：为所有有雨点的用户发放1元优惠券。
+
+    - 如果传入 count（正整数），则为每个用户发放 min(floor(雨点余额), count) 张优惠券。
+    - 如果不传入 count，则沿用原有逻辑：发放数量 = min(floor(雨点余额), 平台设定的上限)
     """
     try:
-        result = service.batch_exchange_coupons()
+        result = service.batch_exchange_coupons(max_per_user=count)
         return ResponseModel(
             success=True,
             message=result['message'],
@@ -719,6 +735,29 @@ async def exchange_coupons(
     except Exception as e:
         logger.error(f"批量兑换优惠券失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"批量兑换失败: {str(e)}")
+
+@router.get("/api/coupons/expiring", response_model=ResponseModel, summary="查询即将过期的优惠券")
+async def get_expiring_coupons(
+    days: int = Query(3, ge=1, le=30, description="即将过期的天数，默认3天"),
+    service: FinanceService = Depends(get_finance_service),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """查询当前用户即将过期的优惠券（指定天数内过期，按有效期升序）"""
+    try:
+        user_id = current_user['id']  # 从认证信息中获取用户ID
+        coupons = service.get_expiring_coupons(user_id, days)
+        return ResponseModel(
+            success=True,
+            message=f"查询成功，共{len(coupons)}张优惠券即将过期",
+            data={
+                "expiring_coupons": coupons,
+                "days": days,
+                "total": len(coupons)
+            }
+        )
+    except Exception as e:
+        logger.error(f"查询即将过期优惠券失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== 2. 推荐奖励接口 ====================
