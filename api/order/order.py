@@ -1,13 +1,18 @@
-from services.finance_service import FinanceService
+from services.finance_service import (
+    FinanceService,
+    cap_discounts_to_merchandise_total,
+    max_coupon_total_yuan,
+    parse_pending_coupon_ids,
+)
 from fastapi import APIRouter, HTTPException, Query, Request, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices, model_validator
 from typing import Optional, List, Dict, Any, cast
 from core.config import Settings, settings
 from core.database import get_conn
 from services.finance_service import split_order_funds
 from core.config import VALID_PAY_WAYS, POINTS_DISCOUNT_RATE
 from core.table_access import build_dynamic_select, get_table_structure, _quote_identifier
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 import uuid
 from datetime import datetime, timedelta
 from enum import Enum
@@ -140,6 +145,7 @@ class OrderManager:
             delivery_way: str = "platform",
             points_to_use: Optional[Decimal] = None,
             coupon_id: Optional[int] = None,
+            coupon_ids: Optional[List[int]] = None,
             idempotency_key: Optional[str] = None,
             merchant_id: Optional[int] = None
     ) -> Optional[str]:
@@ -270,24 +276,30 @@ class OrderManager:
 
                     merchant_id = int(merchant_id or 0)
 
-                    # ---------- 2. 优惠券商品类型验证 ----------
+                    # ---------- 2. 优惠券商品类型验证（支持多张券叠加） ----------
                     has_vip = any(i["is_vip"] for i in items)
-                    coupon_amount = Decimal('0')
+                    coupon_id_list: List[int] = []
+                    if coupon_ids:
+                        coupon_id_list = sorted({int(x) for x in coupon_ids})
+                    elif coupon_id is not None:
+                        coupon_id_list = [int(coupon_id)]
+
+                    sum_coupons = Decimal('0')
 
                     # 先计算商品总额，可用于优惠券/积分验证
                     total = sum(Decimal(str(i["quantity"])) * Decimal(str(i["price"])) for i in items)
 
-                    if coupon_id:
+                    for cid in coupon_id_list:
                         cur.execute("""
                             SELECT id, amount, applicable_product_type, status, valid_from, valid_to, user_id
                             FROM coupons 
                             WHERE id = %s AND user_id = %s AND status = 'unused'
                             FOR UPDATE
-                        """, (coupon_id, user_id))
+                        """, (cid, user_id))
                         coupon = cur.fetchone()
 
                         if not coupon:
-                            raise HTTPException(status_code=400, detail="优惠券不存在、已被使用或不属于当前用户")
+                            raise HTTPException(status_code=400, detail=f"优惠券不存在、已被使用或不属于当前用户: id={cid}")
 
                         today = datetime.now().date()
                         if not (coupon['valid_from'] <= today <= coupon['valid_to']):
@@ -299,29 +311,53 @@ class OrderManager:
                         if applicable_type == 'normal_only' and has_vip:
                             raise HTTPException(status_code=400, detail="该优惠券仅限普通商品使用")
 
-                        coupon_amount = Decimal(str(coupon['amount']))
-                        if coupon_amount > total:
-                            raise HTTPException(status_code=400, detail="优惠券金额不能大于订单金额")
+                        sum_coupons += Decimal(str(coupon['amount']))
 
                     # 检查是否有 cash_only 商品
                     has_cash_only = any(i.get("cash_only") for i in items)
                     if has_cash_only:
                         if points_to_use and points_to_use > 0:
                             raise HTTPException(status_code=400, detail="该商品只能用现金支付，不能使用积分")
-                        if coupon_id:
+                        if coupon_id_list:
                             raise HTTPException(status_code=400, detail="该商品只能用现金支付，不能使用优惠券")
 
-                    # 计算最终应付金额
-                    points_discount = (points_to_use or Decimal('0')) * POINTS_DISCOUNT_RATE
-                    coupon_discount = coupon_amount if coupon_id else Decimal('0')
-                    final_amount = total - (points_discount + coupon_discount)
+                    # 积分先封顶，再校验券叠加上限 = ceil(原价 − 积分抵扣) 到元
+                    pt_use = points_to_use or Decimal('0')
+                    pd_raw = pt_use * POINTS_DISCOUNT_RATE
+                    points_discount = min(pd_raw, total)
+                    if POINTS_DISCOUNT_RATE and POINTS_DISCOUNT_RATE > 0:
+                        pt_use = (points_discount / POINTS_DISCOUNT_RATE).quantize(
+                            Decimal('0.0001'), rounding=ROUND_DOWN
+                        )
+                    else:
+                        pt_use = Decimal('0')
+
+                    max_c = max_coupon_total_yuan(total, points_discount)
+                    if sum_coupons > max_c:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"优惠券叠加面额不能超过{max_c}元（商品金额扣减积分抵扣后，向上取整到元）"
+                        )
+
+                    coupon_discount = sum_coupons
+                    points_to_use = pt_use
+                    # 与结算侧一致的安全收斂（边界数值）
+                    coupon_discount, points_discount, pt_use = cap_discounts_to_merchandise_total(
+                        total, coupon_discount, pt_use
+                    )
+                    points_to_use = pt_use
+                    final_amount = total - points_discount - coupon_discount
+
+                    pending_coupon_ids_json = json.dumps(coupon_id_list) if coupon_id_list else None
+                    pending_coupon_single = coupon_id_list[0] if len(coupon_id_list) == 1 else None
 
                     # 判断是否零元订单（新增）
                     is_zero_order = final_amount <= Decimal('0')
 
                     # 判断初始状态和过期时间
                     if is_zero_order:
-                        init_status = "pending_recv"
+                        # 与支付回调一致：快递/平台配送 → 待发货；自提 → 待收货（结算成功后会再 update_status，含全虚拟→已完成）
+                        init_status = "pending_recv" if delivery_way == "pickup" else "pending_ship"
                         expire_at = None
                     else:
                         init_status = "pending_pay"
@@ -353,11 +389,11 @@ class OrderManager:
                             consignee_name, consignee_phone,
                             province, city, district, shipping_address, delivery_way,
                             pay_way, auto_recv_time, refund_reason, expire_at,
-                            pending_points, pending_coupon_id,
+                            pending_points, pending_coupon_id, pending_coupon_ids,
                             points_discount, coupon_discount)
                         VALUES (%s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s,
-                                'wechat', %s, %s, %s, %s, %s, %s, %s)
+                                'wechat', %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         user_id, merchant_id, order_number, final_amount, total, init_status, has_vip,
                         consignee_name, consignee_phone,
@@ -366,7 +402,8 @@ class OrderManager:
                         specifications,
                         expire_at,
                         points_to_use or Decimal('0'),
-                        coupon_id,
+                        pending_coupon_single,
+                        pending_coupon_ids_json,
                         points_discount,
                         coupon_discount
                     ))
@@ -614,14 +651,19 @@ class OrderManager:
                     )
                     merchant_info = cur.fetchone()
 
-                                # ===== 新增：查询待支付优惠券金额 =====
+                # ===== 待支付优惠券（支持多张叠加面额） =====
+                pending_coupon_ids = parse_pending_coupon_ids(order)
                 pending_coupon_amount = None
+                if pending_coupon_ids:
+                    ph = ",".join(["%s"] * len(pending_coupon_ids))
+                    cur.execute(
+                        f"SELECT COALESCE(SUM(amount), 0) AS s FROM coupons WHERE id IN ({ph})",
+                        pending_coupon_ids,
+                    )
+                    srow = cur.fetchone()
+                    if srow and srow.get("s") is not None:
+                        pending_coupon_amount = float(srow["s"])
                 pending_coupon_id = order.get("pending_coupon_id")
-                if pending_coupon_id:
-                    cur.execute("SELECT amount FROM coupons WHERE id = %s", (pending_coupon_id,))
-                    coupon_row = cur.fetchone()
-                    if coupon_row:
-                        pending_coupon_amount = float(coupon_row["amount"])
                 # ======================================
 
                 address = {
@@ -643,6 +685,7 @@ class OrderManager:
                     # ===== 新增返回 pending 字段 =====
                     "pending_points": float(order.get("pending_points") or 0),
                     "pending_coupon_id": pending_coupon_id,
+                    "pending_coupon_ids": pending_coupon_ids,
                     "pending_coupon_amount": pending_coupon_amount,
                     # ===== 方便前端直接读取已抵扣金额 =====
                     "points_discount": float(order.get("points_discount") or 0),
@@ -949,23 +992,147 @@ class DeliveryWay(str, Enum):
 
 
 class OrderCreate(BaseModel):
-    user_id: int
-    delivery_way: DeliveryWay = DeliveryWay.platform
-    address_id: Optional[int] = None
-    custom_address: Optional[dict] = None
+    """同时接受 snake_case 与小程序常用 camelCase 请求体字段。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_coupon_payload(cls, data: Any) -> Any:
+        """兼容嵌套 body、单值券 ID、字符串列表等小程序常见传参。"""
+        if not isinstance(data, dict):
+            return data
+        d: Dict[str, Any] = dict(data)
+        # 一层嵌套：{ "data": { ... } } / payload / order
+        for wrap in ("data", "payload", "order"):
+            inner = d.get(wrap)
+            if isinstance(inner, dict):
+                rest = {k: v for k, v in d.items() if k != wrap}
+                d = {**inner, **rest}
+                break
+
+        def _coerce_id_list(v: Any) -> Optional[List[int]]:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return None
+            if isinstance(v, int):
+                return [v]
+            if isinstance(v, float):
+                return [int(v)]
+            if isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return None
+                if s.startswith("[") and s.endswith("]"):
+                    try:
+                        parsed = json.loads(s)
+                        if isinstance(parsed, list):
+                            return [int(x) for x in parsed if x is not None]
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        pass
+                out: List[int] = []
+                for part in s.replace("，", ",").split(","):
+                    part = part.strip()
+                    if part.isdigit():
+                        out.append(int(part))
+                return out or None
+            if isinstance(v, list):
+                out = []
+                for x in v:
+                    if x is None:
+                        continue
+                    if isinstance(x, dict) and "id" in x:
+                        out.append(int(x["id"]))
+                    else:
+                        out.append(int(x))
+                return out or None
+            return None
+
+        # 统一写到 snake_case，后续 Field 仍可通过别名覆盖
+        if d.get("coupon_ids") is None and d.get("couponIds") is not None:
+            d["coupon_ids"] = d.pop("couponIds")
+        ids = _coerce_id_list(d.get("coupon_ids"))
+        if ids is not None:
+            d["coupon_ids"] = ids
+
+        if d.get("coupon_id") is None and d.get("couponId") is not None:
+            d["coupon_id"] = d.pop("couponId")
+        # 其它常见键名
+        if not d.get("coupon_ids") and d.get("coupon_id") is None:
+            for alt in ("selectedCouponId", "selected_coupon_id", "couponID"):
+                if alt not in d or d[alt] is None or d[alt] == "":
+                    continue
+                try:
+                    d["coupon_ids"] = [int(d.pop(alt))]
+                    break
+                except (TypeError, ValueError):
+                    continue
+        raw_objs = d.get("coupons") or d.get("couponList") or d.get("coupon_list")
+        if raw_objs and not d.get("coupon_ids") and d.get("coupon_id") is None:
+            if isinstance(raw_objs, list):
+                idl: List[int] = []
+                for it in raw_objs:
+                    if isinstance(it, dict) and it.get("id") is not None:
+                        idl.append(int(it["id"]))
+                if idl:
+                    d["coupon_ids"] = idl
+
+        cid = d.get("coupon_id")
+        if cid is not None and cid != "" and not isinstance(cid, bool):
+            try:
+                d["coupon_id"] = int(cid)
+            except (TypeError, ValueError):
+                d["coupon_id"] = None
+
+        return d
+
+    user_id: int = Field(validation_alias=AliasChoices("user_id", "userId"))
+    delivery_way: DeliveryWay = Field(
+        default=DeliveryWay.platform,
+        validation_alias=AliasChoices("delivery_way", "deliveryWay"),
+    )
+    address_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("address_id", "addressId"),
+    )
+    custom_address: Optional[dict] = Field(
+        default=None,
+        validation_alias=AliasChoices("custom_address", "customAddress"),
+    )
     specifications: Optional[str] = None
-    buy_now: bool = False
-    buy_now_items: Optional[List[Dict[str, Any]]] = None
-    points_to_use: Optional[Decimal] = Decimal('0')
-    coupon_id: Optional[int] = None
-    idempotency_key: Optional[str] = None
-    merchant_id: Optional[int] = None
+    buy_now: bool = Field(default=False, validation_alias=AliasChoices("buy_now", "buyNow"))
+    buy_now_items: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        validation_alias=AliasChoices("buy_now_items", "buyNowItems"),
+    )
+    points_to_use: Optional[Decimal] = Field(
+        default=Decimal('0'),
+        validation_alias=AliasChoices("points_to_use", "pointsToUse"),
+    )
+    coupon_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("coupon_id", "couponId"),
+    )
+    coupon_ids: Optional[List[int]] = Field(
+        default=None,
+        validation_alias=AliasChoices("coupon_ids", "couponIds"),
+    )
+    idempotency_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("idempotency_key", "idempotencyKey"),
+    )
+    merchant_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("merchant_id", "merchantId"),
+    )
 
 
 class OrderPay(BaseModel):
     order_number: str
     pay_way: str
     coupon_id: Optional[int] = None
+    coupon_ids: Optional[List[int]] = None
     points_to_use: Optional[Decimal] = Decimal('0')
 
 
@@ -1000,6 +1167,13 @@ class MerchantOrdersQuery(BaseModel):
 # ---------------- 路由 ----------------
 @router.post("/create", summary="创建订单")
 def create_order(body: OrderCreate):
+    logger.info(
+        "创建订单入参(券): user_id=%s buy_now=%s coupon_id=%s coupon_ids=%s",
+        body.user_id,
+        body.buy_now,
+        body.coupon_id,
+        body.coupon_ids,
+    )
     result = OrderManager.create(
         body.user_id,
         body.address_id,
@@ -1010,6 +1184,7 @@ def create_order(body: OrderCreate):
         delivery_way=body.delivery_way,
         points_to_use=body.points_to_use,
         coupon_id=body.coupon_id,
+        coupon_ids=body.coupon_ids,
         idempotency_key=body.idempotency_key,
         merchant_id=body.merchant_id
     )

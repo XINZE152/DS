@@ -311,17 +311,17 @@ class TaskScheduler:
             from datetime import datetime, timedelta
 
             wx_service = WechatShippingService()
-            # 查询昨天支付的需要同步的订单
-            yesterday_start = int(
-                time.mktime((datetime.now() - timedelta(days=1)).replace(hour=0, minute=0, second=0).timetuple()))
-            yesterday_end = int(
-                time.mktime((datetime.now() - timedelta(days=1)).replace(hour=23, minute=59, second=59).timetuple()))
+            # 查询近 7 天已支付订单，与微信发货管理状态对齐（原仅昨天易漏单）
+            range_start = int(
+                time.mktime((datetime.now() - timedelta(days=7)).replace(hour=0, minute=0, second=0).timetuple())
+            )
+            range_end = int(time.time())
 
             last_index = ""
             while True:
                 result = wx_service.get_order_list(
-                    begin_time=yesterday_start,
-                    end_time=yesterday_end,
+                    begin_time=range_start,
+                    end_time=range_end,
                     last_index=last_index,
                     page_size=100
                 )
@@ -348,13 +348,25 @@ class TaskScheduler:
                             if not local_order:
                                 continue
 
-                            # 状态映射：微信状态3=确认收货，对应本地completed
-                            if wx_state == 3 and local_order['status'] != 'completed':
+                            # 微信 order_state：1待发货 2已发货 3确认收货 4交易完成 …
+                            st = local_order["status"]
+                            if wx_state in (3, 4) and st != "completed":
                                 logger.info(
-                                    f"微信订单状态为已收货，但本地订单 {transaction_id} 状态为 {local_order['status']}，尝试同步")
-                                # 复用 OrderManager.update_status 更新状态，保持一致性
-                                OrderManager.update_status(local_order['order_number'], 'completed', external_conn=conn)
-                                logger.info(f"本地订单 {transaction_id} 状态已同步为 completed")
+                                    "微信订单已确认收货/交易完成，同步本地 completed: tx=%s local=%s",
+                                    transaction_id,
+                                    st,
+                                )
+                                OrderManager.update_status(
+                                    local_order["order_number"], "completed", external_conn=conn
+                                )
+                            elif wx_state == 2 and st == "pending_ship":
+                                logger.info(
+                                    "微信侧已发货，本地仍为待发货，同步为待收货: tx=%s",
+                                    transaction_id,
+                                )
+                                OrderManager.update_status(
+                                    local_order["order_number"], "pending_recv", external_conn=conn
+                                )
                     # ==================== 新增：提交事务 ====================
                     conn.commit()
                     # =======================================================

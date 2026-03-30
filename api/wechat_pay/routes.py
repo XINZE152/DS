@@ -4,7 +4,12 @@ from core.wx_pay_client import WeChatPayClient
 from core.config import ENVIRONMENT, WECHAT_PAY_API_V3_KEY, POINTS_DISCOUNT_RATE
 from core.response import success_response
 from core.database import get_conn
-from services.finance_service import FinanceService
+from services.finance_service import (
+    FinanceService,
+    parse_pending_coupon_ids,
+    parse_offline_coupon_ids,
+    max_coupon_total_yuan,
+)
 from decimal import Decimal
 from services.wechat_applyment_service import WechatApplymentService
 from datetime import datetime
@@ -26,7 +31,8 @@ pay_client = WeChatPayClient()
 @router.post("/create-order", summary="创建JSAPI订单并返回前端支付参数")
 async def create_jsapi_order(request: Request):
     """创建 JSAPI 订单并返回前端调用 `wx.requestPayment`/小程序支付所需参数。
-    请求 JSON 应包含：out_trade_no/order_id, total_fee(分), openid, description(可选), coupon_id(可选), points_to_use(可选,分)
+    请求 JSON：out_trade_no/order_id, total_fee(分), openid, description(可选)；
+    coupon_ids(可选,多张券ID数组) 或 coupon_id(可选,单张)；points_to_use(可选)
     """
     try:
         payload = await request.json()
@@ -38,6 +44,13 @@ async def create_jsapi_order(request: Request):
     openid = payload.get('openid')
     description = payload.get('description', '商品支付')
     coupon_id = payload.get('coupon_id')
+    raw_coupon_ids = payload.get('coupon_ids')
+    if isinstance(raw_coupon_ids, list) and raw_coupon_ids:
+        payload_coupon_ids = sorted({int(x) for x in raw_coupon_ids})
+    elif coupon_id is not None:
+        payload_coupon_ids = [int(coupon_id)]
+    else:
+        payload_coupon_ids = []
     # ========== 新增：获取积分使用量 ==========
     points_to_use = payload.get('points_to_use')  # 单位：分，可选
     # ======================================
@@ -62,9 +75,9 @@ async def create_jsapi_order(request: Request):
                 # to total_amount (already discounted), causing payable_cents to be
                 # computed too low (double-subtracting discounts).
                 cur.execute(
-                    "SELECT id, user_id, status, delivery_way, original_amount, total_amount, pending_points, pending_coupon_id "
-                    "FROM orders WHERE order_number=%s",
-                    (out_trade_no,)
+                    "SELECT id, user_id, status, delivery_way, original_amount, total_amount, pending_points, "
+                    "pending_coupon_id, pending_coupon_ids FROM orders WHERE order_number=%s",
+                    (out_trade_no,),
                 )
                 order_row = cur.fetchone()
                 if not order_row:
@@ -96,98 +109,103 @@ async def create_jsapi_order(request: Request):
                 # 使用 original_amount 减去本次 pending 优惠，而不是再次从 total_amount 扣减
                 # original_amount is now guaranteed to exist because we selected it above.
                 original_amount = Decimal(str(order_row.get('original_amount') or order_row.get('total_amount') or 0))
-                coupon_amt = Decimal('0')
-                # 收集当前 pending 信息
                 stored_pending = Decimal(str(order_row.get('pending_points') or 0))
-                stored_coupon_id = order_row.get('pending_coupon_id')
+                stored_coupon_ids = parse_pending_coupon_ids(order_row)
 
-                pending_coupon_id = order_row.get('pending_coupon_id')
-                # 允许在下单时绑定优惠券（未绑定时才绑定）或更改
-                if coupon_id:
-                    if pending_coupon_id and pending_coupon_id != coupon_id:
-                        raise HTTPException(status_code=409, detail="order already bound to another coupon")
-                    target_coupon_id = pending_coupon_id or coupon_id
+                if payload_coupon_ids:
+                    target_coupon_ids = payload_coupon_ids
+                else:
+                    target_coupon_ids = list(stored_coupon_ids)
 
+                coupon_amt = Decimal('0')
+                for cid in target_coupon_ids:
                     cur.execute(
                         "SELECT id, user_id, amount, status, valid_from, valid_to FROM coupons WHERE id=%s",
-                        (target_coupon_id,)
+                        (cid,),
                     )
                     coupon_row = cur.fetchone()
                     if not coupon_row or coupon_row.get('user_id') != order_row.get('user_id'):
-                        raise HTTPException(status_code=400, detail="coupon not available for user")
+                        raise HTTPException(status_code=400, detail=f"coupon not available: {cid}")
                     if coupon_row.get('status') != 'unused':
                         raise HTTPException(status_code=409, detail="coupon already used")
-
                     today = datetime.now().date()
-                    valid_from = coupon_row.get('valid_from')
-                    valid_to = coupon_row.get('valid_to')
-                    if valid_from and valid_to and not (valid_from <= today <= valid_to):
+                    vf, vt = coupon_row.get('valid_from'), coupon_row.get('valid_to')
+                    if vf and vt and not (vf <= today <= vt):
                         raise HTTPException(status_code=400, detail="coupon expired")
+                    coupon_amt += Decimal(str(coupon_row.get('amount') or 0))
 
-                    if not pending_coupon_id:
-                        cur.execute(
-                            "UPDATE orders SET pending_coupon_id=%s WHERE id=%s",
-                            (target_coupon_id, order_row['id'])
-                        )
-                    pending_coupon_id = target_coupon_id
-
-                if pending_coupon_id:
-                    cur.execute("SELECT amount, status FROM coupons WHERE id=%s", (pending_coupon_id,))
-                    coupon_row = cur.fetchone()
-                    if coupon_row:
-                        coupon_amt = Decimal(str(coupon_row.get('amount') or 0))
-                        if coupon_row.get('status') == 'used':
-                            raise HTTPException(status_code=409, detail="coupon already used")
-
-                # 计算应付金额：从 original_amount 扣减本次 pending 优惠
-                payable_cents = int(original_amount * Decimal('100'))
-                payable_cents -= int(pending_points * Decimal('100'))
-                payable_cents -= int(coupon_amt * Decimal('100'))
-
-                # 如果前端修改了积分/券，则同步更新订单行并重新计算 total_amount
-                if pending_points != stored_pending or pending_coupon_id != stored_coupon_id:
-                    new_total = (original_amount - pending_points - coupon_amt)
-                    # points_discount should reflect used points * rate
-                    pd = pending_points * POINTS_DISCOUNT_RATE
-                    cur.execute(
-                        "UPDATE orders SET total_amount=%s, pending_points=%s, pending_coupon_id=%s, points_discount=%s, coupon_discount=%s WHERE id=%s",
-                        (new_total, pending_points, pending_coupon_id, pd, coupon_amt, order_row['id'])
+                pd_yuan = pending_points * POINTS_DISCOUNT_RATE
+                pd_cap = min(pd_yuan, original_amount)
+                max_c = max_coupon_total_yuan(original_amount, pd_cap)
+                if coupon_amt > max_c:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"优惠券叠加超过上限{max_c}元（扣减积分抵扣后向上取整到元）",
                     )
-                    total_amount = new_total
-                else:
-                    total_amount = Decimal(str(order_row.get('total_amount') or 0))
 
-                # ========== 新增：提交事务，确保更新持久化 ==========
-                conn.commit()
-                # =================================================
+                pending_coupon_id = target_coupon_ids[0] if len(target_coupon_ids) == 1 else None
+                pending_coupon_ids_json = json.dumps(target_coupon_ids) if target_coupon_ids else None
+                points_discount_yuan = pending_points * POINTS_DISCOUNT_RATE
+                new_total = original_amount - points_discount_yuan - coupon_amt
+                payable_cents = int((new_total * Decimal('100')).quantize(Decimal('1')))
+                ids_changed = sorted(target_coupon_ids) != sorted(stored_coupon_ids)
 
-                # ==================== 零元订单处理 ====================
+                def _sync_order_pay_fields(charge_yuan: Decimal) -> None:
+                    cur.execute(
+                        """UPDATE orders SET total_amount=%s, pending_points=%s, pending_coupon_id=%s,
+                           pending_coupon_ids=%s, points_discount=%s, coupon_discount=%s WHERE id=%s""",
+                        (
+                            charge_yuan,
+                            pending_points,
+                            pending_coupon_id,
+                            pending_coupon_ids_json,
+                            points_discount_yuan,
+                            coupon_amt,
+                            order_row['id'],
+                        ),
+                    )
+
+                # 零元订单：先落库再返回模拟支付
                 if payable_cents <= 0:
-                    logger.info(f"零元订单 {out_trade_no} 无需支付，返回模拟支付参数 (原始金额¥%s, total_amount¥%s)" % (
-                    order_row.get('original_amount'), order_row.get('total_amount')))
+                    _sync_order_pay_fields(max(new_total, Decimal('0')))
+                    conn.commit()
+                    logger.info(
+                        f"零元订单 {out_trade_no} 无需支付 (原始金额¥{order_row.get('original_amount')})"
+                    )
                     return {
                         "appId": settings.WECHAT_APP_ID,
                         "timeStamp": str(int(time.time())),
                         "nonceStr": uuid.uuid4().hex,
                         "package": "prepay_id=ZERO_ORDER",
                         "signType": "RSA",
-                        "paySign": "ZERO_ORDER_SIGN"
+                        "paySign": "ZERO_ORDER_SIGN",
                     }
-                # ====================================================
 
+                # 客户端 total_fee（分）可低于服务端计算：与微信实付必须一致，故落库 total_amount 须同步
+                final_cents = payable_cents
                 if total_fee_client_int != payable_cents:
                     logger.warning(
                         "订单支付金额校正: client=%s, server=%s, order=%s",
-                        total_fee_client, payable_cents, out_trade_no
+                        total_fee_client, payable_cents, out_trade_no,
                     )
-                    # 若客户端传入金额更低，视为已应用优惠券/积分后的最终应付，优先采用客户端金额
                     if 0 < total_fee_client_int < payable_cents:
                         logger.info(
                             "使用客户端金额作为应付金额: client=%s, server=%s, order=%s",
-                            total_fee_client_int, payable_cents, out_trade_no
+                            total_fee_client_int, payable_cents, out_trade_no,
                         )
-                        payable_cents = total_fee_client_int
-                total_fee = payable_cents
+                        final_cents = total_fee_client_int
+
+                charge_yuan = (Decimal(final_cents) / Decimal(100)).quantize(Decimal('0.01'))
+                stored_total = Decimal(str(order_row.get('total_amount') or 0)).quantize(Decimal('0.01'))
+                if (
+                    pending_points != stored_pending
+                    or ids_changed
+                    or charge_yuan != stored_total
+                ):
+                    _sync_order_pay_fields(charge_yuan)
+
+                conn.commit()
+                total_fee = final_cents
 
         # 到这里无需持有连接，调用微信接口
         # 1) 调用微信下单，获取 prepay_id
@@ -430,12 +448,25 @@ async def wechat_pay_notify(request: Request):
             return _xml_response("SUCCESS", "OK")
         # ===== 新增：处理微信发货管理相关事件 =====
         elif event_type == "trade_manage_remind_shipping":
-            # 微信提醒你需要发货了
-            await handle_trade_manage_remind_shipping(decrypted_data)
+            from services.wechat_trade_manage_service import process_trade_manage_remind_shipping
+
+            process_trade_manage_remind_shipping(decrypted_data)
             return _xml_response("SUCCESS", "OK")
         elif event_type == "trade_manage_order_settlement":
-            # 订单将要结算或已经结算
-            await handle_trade_manage_order_settlement(decrypted_data)
+            from services.wechat_trade_manage_service import process_trade_manage_order_settlement
+
+            process_trade_manage_order_settlement(decrypted_data)
+            return _xml_response("SUCCESS", "OK")
+        elif event_type in ("trade_manage_remind_access_api", "wxa_trade_controlled"):
+            from services.wechat_trade_manage_service import (
+                process_trade_manage_remind_access_api,
+                process_wxa_trade_controlled,
+            )
+
+            if event_type == "trade_manage_remind_access_api":
+                process_trade_manage_remind_access_api(decrypted_data)
+            else:
+                process_wxa_trade_controlled(decrypted_data)
             return _xml_response("SUCCESS", "OK")
         # ==========================================
         else:
@@ -574,7 +605,16 @@ async def handle_transaction_success(data: dict):
         logger.error("支付回调缺少 out_trade_no")
         return
 
-    logger.info(f"支付成功: 订单号={out_trade_no}, 微信流水号={transaction_id}, 金额={amount}")
+    # 与小程序「发货管理」列表对齐：须与公众平台绑定的 appid、mchid 一致（便于排查搜不到单）
+    logger.info(
+        "支付成功: 订单号=%s, 微信流水号=%s, 金额=%s, appid=%s, mchid=%s, sub_mchid=%s",
+        out_trade_no,
+        transaction_id,
+        amount,
+        data.get("appid"),
+        data.get("mchid"),
+        data.get("sub_mchid"),
+    )
 
     try:
         if out_trade_no.startswith("OFF"):
@@ -603,7 +643,7 @@ async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
                 # 查询并锁定订单
                 cur.execute(
-                    "SELECT id, user_id, amount, paid_amount, status, coupon_id, merchant_id, store_name "
+                    "SELECT id, user_id, amount, paid_amount, status, coupon_id, coupon_ids, coupon_discount, merchant_id, store_name "
                     "FROM offline_order WHERE order_no = %s FOR UPDATE",
                     (order_no,)
                 )
@@ -621,12 +661,23 @@ async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount
                 db_total = order.get("paid_amount")
                 if db_total is None or db_total == 0:
                     logger.warning(f"[offline-pay] 订单 {order_no} paid_amount 为0或None，尝试从优惠券重新计算")
-                    coupon_discount = 0
-                    if order["coupon_id"]:
-                        cur.execute("SELECT amount FROM coupons WHERE id = %s", (order["coupon_id"],))
-                        coupon_row = cur.fetchone()
-                        if coupon_row:
-                            coupon_discount = int(Decimal(coupon_row["amount"]) * 100)
+                    coupon_discount = int(order.get("coupon_discount") or 0)
+                    if coupon_discount <= 0:
+                        coupon_discount = 0
+                        cids = parse_offline_coupon_ids(order)
+                        if cids:
+                            ph = ",".join(["%s"] * len(cids))
+                            cur.execute(
+                                f"SELECT id, amount FROM coupons WHERE id IN ({ph})",
+                                tuple(cids),
+                            )
+                            rows = cur.fetchall() or []
+                            by_id = {int(r["id"]): r for r in rows}
+                            for cid in cids:
+                                r = by_id.get(int(cid))
+                                if not r:
+                                    continue
+                                coupon_discount += int(Decimal(r["amount"]) * 100)
                     expected_paid = order["amount"] - coupon_discount
                     if expected_paid < 0:
                         expected_paid = 0
@@ -643,15 +694,17 @@ async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount
                         raise ValueError(f"金额不一致: 微信{amount}≠系统{db_total}")
 
                 # 核销优惠券（如果有）
-                if order["coupon_id"]:
+                offline_cids = parse_offline_coupon_ids(order)
+                if offline_cids:
                     try:
                         fs = FinanceService()
-                        fs.use_coupon(
-                            coupon_id=order["coupon_id"],
-                            user_id=order["user_id"],
-                            order_type="normal"
-                        )
-                        logger.info(f"[offline-pay] 优惠券核销成功: 订单={order_no}, 优惠券={order['coupon_id']}")
+                        for cid in offline_cids:
+                            fs.use_coupon(
+                                coupon_id=int(cid),
+                                user_id=order["user_id"],
+                                order_type="normal"
+                            )
+                        logger.info(f"[offline-pay] 优惠券核销成功: 订单={order_no}, 优惠券={offline_cids}")
                     except Exception as e:
                         logger.error(f"[offline-pay] 优惠券核销失败（需人工处理）: 订单={order_no}, 错误={e}")
 
@@ -669,11 +722,13 @@ async def _handle_offline_pay_success(order_no: str, transaction_id: str, amount
                 )
 
                 # 资金分账
-                await OfflineService.on_paid(
+                tw = await OfflineService.on_paid(
                     order_no=order_no,
                     amount=Decimal(db_total) / 100,
-                    coupon_discount=Decimal(order["amount"] - db_total) / 100 if order["coupon_id"] else Decimal(0)
+                    coupon_discount=Decimal(order["amount"] - db_total) / 100 if offline_cids else Decimal(0)
                 )
+                if tw:
+                    logger.warning(f"[offline-pay] 商家转账未成功（已分账） order={order_no}: {tw}")
 
                 conn.commit()
                 logger.info(f"[offline-pay] 线下订单支付成功: {order_no}")
@@ -691,9 +746,10 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
                 # 查询订单信息
                 cur.execute(
                     "SELECT id, user_id, total_amount, status, delivery_way, "
-                    "pending_points, pending_coupon_id, original_amount "
+                    "pending_points, pending_coupon_id, pending_coupon_ids, original_amount, "
+                    "coupon_discount, points_discount "
                     "FROM orders WHERE order_number=%s FOR UPDATE",
-                    (order_no,)
+                    (order_no,),
                 )
                 order = cur.fetchone()
                 if not order:
@@ -702,55 +758,60 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
                     logger.info(f"订单 {order_no} 状态为 {order.get('status')}，已处理，忽略")
                     return
 
-                # ✅ 关键修复：直接使用 total_amount 计算应付金额（单位：分）
-                db_total = int(Decimal(order['total_amount']) * 100)
+                db_total = int((Decimal(str(order['total_amount'] or 0)) * 100).quantize(Decimal('1')))
 
-                # 优惠券处理（仅锁定和核销，不再参与金额计算）
                 coupon_amt = Decimal('0')
-                if order.get('pending_coupon_id'):
-                    # 先检查订单状态，防止重复处理
-                    if order.get('status') != 'pending_pay':
-                        logger.info(
-                            f"订单 {order_no} 状态已不是 pending_pay（当前={order['status']}），可能已处理，直接返回")
-                        return
+                coupon_id_list = parse_pending_coupon_ids(order)
+                if coupon_id_list:
+                    for cid in coupon_id_list:
+                        cur.execute(
+                            """SELECT id, amount, status, valid_to, user_id 
+                               FROM coupons 
+                               WHERE id = %s 
+                               FOR UPDATE""",
+                            (cid,),
+                        )
+                        coupon_row = cur.fetchone()
+                        if not coupon_row or coupon_row['status'] != 'unused' or coupon_row[
+                            'valid_to'] < datetime.now().date():
+                            if order.get('status') == 'pending_pay':
+                                logger.error(
+                                    f"订单 {order_no} 优惠券 {cid} 状态异常 "
+                                    f"(status={coupon_row['status'] if coupon_row else 'not found'})，需人工介入"
+                                )
+                            return
+                        if coupon_row['user_id'] != order['user_id']:
+                            logger.error(f"订单 {order_no} 优惠券 {cid} 用户不匹配")
+                            return
+                        coupon_amt += Decimal(str(coupon_row['amount']))
 
-                    cur.execute(
-                        """SELECT amount, status, valid_to, user_id 
-                           FROM coupons 
-                           WHERE id = %s 
-                           FOR UPDATE""",
-                        (order['pending_coupon_id'],)
-                    )
-                    coupon_row = cur.fetchone()
+                    orig = Decimal(str(order.get('original_amount') or 0))
+                    pp = Decimal(str(order.get('pending_points') or 0))
+                    pd = pp * POINTS_DISCOUNT_RATE
+                    if pd > orig:
+                        pd = orig
+                    max_c = max_coupon_total_yuan(orig, pd)
+                    if coupon_amt > max_c:
+                        raise ValueError(f"优惠券叠加超过上限{max_c}")
 
-                    # 优惠券不可用的情况（已使用、过期、不存在）
-                    if not coupon_row or coupon_row['status'] != 'unused' or coupon_row[
-                        'valid_to'] < datetime.now().date():
-                        # 如果订单仍是 pending_pay，说明数据异常，需记录错误但返回成功（避免微信重试）
-                        if order.get('status') == 'pending_pay':
-                            logger.error(
-                                f"订单 {order_no} 优惠券 {order['pending_coupon_id']} 状态异常 "
-                                f"(status={coupon_row['status'] if coupon_row else 'not found'})，但订单仍为 pending_pay，需人工介入"
-                            )
-                        else:
-                            logger.info(f"订单 {order_no} 优惠券不可用但订单状态已变更，视为已处理")
-                        return
-
-                    # 正常核销优惠券
-                    cur.execute(
-                        "UPDATE coupons SET status='used', used_at=NOW() WHERE id=%s AND status='unused'",
-                        (order['pending_coupon_id'],)
-                    )
-                    if cur.rowcount == 0:
+                    for cid in coupon_id_list:
+                        cur.execute(
+                            "UPDATE coupons SET status='used', used_at=NOW() WHERE id=%s AND status='unused'",
+                            (cid,),
+                        )
+                        if cur.rowcount == 0:
+                            logger.warning(f"订单 {order_no} 优惠券 {cid} 核销影响行数为0")
+                            if order.get('status') == 'pending_pay':
+                                logger.error(f"订单 {order_no} 优惠券核销失败，需人工介入")
+                            return
+                else:
+                    coupon_amt = Decimal(str(order.get("coupon_discount") or 0))
+                    if coupon_amt > 0:
                         logger.warning(
-                            f"订单 {order_no} 优惠券 {order['pending_coupon_id']} 更新影响行数为0，可能已被其他进程使用")
-                        if order.get('status') == 'pending_pay':
-                            logger.error(
-                                f"订单 {order_no} 优惠券核销失败，但订单仍为 pending_pay，可能并发异常，需人工介入")
-                        return
-
-                    # ✅ 记录优惠券金额
-                    coupon_amt = Decimal(str(coupon_row['amount']))
+                            "订单 %s 无 pending_coupon_ids 但存在 coupon_discount=%s，跳过核销，按落库券额结算",
+                            order_no,
+                            coupon_amt,
+                        )
 
                 # 微信支付金额与系统应付金额核对
                 if amount != db_total:
@@ -794,38 +855,6 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
     except Exception as e:
         logger.error(f"线上订单支付成功处理失败: {e}", exc_info=True)
         # 异常已由上层捕获，订单状态保持 pending_pay，不会错误更新
-
-async def handle_trade_manage_remind_shipping(data: dict):
-    """处理发货提醒事件"""
-    transaction_id = data.get("transaction_id")
-    merchant_trade_no = data.get("merchant_trade_no")
-    logger.warning(f"收到微信发货提醒: transaction_id={transaction_id}, order_no={merchant_trade_no}。请检查订单发货状态。")
-    # 这里可以触发内部告警或记录
-
-async def handle_trade_manage_order_settlement(data: dict):
-    """处理订单结算事件（用户确认收货后微信推送）"""
-    transaction_id = data.get("transaction_id")
-    merchant_trade_no = data.get("merchant_trade_no")
-    settlement_time = data.get("settlement_time")
-    logger.info(f"订单结算通知: transaction_id={transaction_id}, order_no={merchant_trade_no}, 结算时间={settlement_time}")
-
-    if not transaction_id:
-        return
-
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, order_number, status FROM orders WHERE transaction_id=%s", (transaction_id,))
-                order = cur.fetchone()
-                if order and order['status'] != 'completed':
-                    cur.execute(
-                        "UPDATE orders SET status='completed', completed_at=NOW() WHERE id=%s",
-                        (order['id'],)
-                    )
-                    conn.commit()
-                    logger.info(f"订单 {order['order_number']} 已根据微信结算事件更新为已完成")
-    except Exception as e:
-        logger.error(f"处理订单结算事件失败: {e}", exc_info=True)
 
 # 注册路由函数（原文件末尾已有，保留不变）
 def register_wechat_pay_routes(app):

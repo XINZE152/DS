@@ -4,7 +4,7 @@ import threading
 import asyncio
 from functools import wraps
 from collections import defaultdict, deque
-from typing import Callable, Any, Optional, Union
+from typing import Callable, Any, Optional, Union, DefaultDict
 import os
 
 from core.logging import get_logger
@@ -174,3 +174,28 @@ class RateLimiter:
 # 建议：结算账户类接口更严格（5次/秒），查询类可放宽（10次/秒）
 settlement_rate_limiter = RateLimiter(max_calls=5, period=1)
 query_rate_limiter = RateLimiter(max_calls=10, period=1)
+
+
+class SimpleWindowIPRateLimiter:
+    """按客户端 IP 的滑动窗口计数；超过阈值则拒绝（用于公开 H5 落地页）。"""
+
+    def __init__(self, max_calls: int, period_seconds: float):
+        self.max_calls = max_calls
+        self.period_seconds = period_seconds
+        self._by_ip: DefaultDict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, ip: str) -> bool:
+        with self._lock:
+            now = time.time()
+            q = self._by_ip[ip]
+            while q and now - q[0] > self.period_seconds:
+                q.popleft()
+            if len(q) >= self.max_calls:
+                return False
+            q.append(now)
+            return True
+
+
+# 永久收款 H5 中转 /offline（及兼容 /pay-bridge）：默认每 IP 每分钟 60 次
+pay_bridge_ip_limiter = SimpleWindowIPRateLimiter(max_calls=60, period_seconds=60.0)

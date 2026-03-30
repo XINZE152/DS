@@ -1,5 +1,8 @@
 # api/offline/routes.py  —— 统一风格版
+import json
+
 from fastapi import APIRouter, HTTPException, Query, Depends, Request, Response, Body
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
@@ -14,9 +17,32 @@ import xmltodict
 from services.notify_service import handle_pay_notify
 from decimal import Decimal, ROUND_HALF_UP
 from services.finance_service import FinanceService
+from core.rate_limiter import pay_bridge_ip_limiter
+from services.wechat_api import (
+    get_or_create_permanent_pay_openlink,
+    get_or_create_permanent_pay_urllink,
+)
 
 logger = get_logger(__name__)
 security = HTTPBearer()
+# 扫码落地页无需 Bearer（与静态页 /offline/ 配合）
+offline_public_router = APIRouter()
+pay_bridge_router = APIRouter()
+
+
+def _pay_bridge_client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _pay_bridge_is_wechat_browser(request: Request) -> bool:
+    ua = (request.headers.get("user-agent") or "").lower()
+    return "micromessenger" in ua
+
 router = APIRouter(
     dependencies=[Depends(security)]  # Swagger 会识别并出现锁图标
 )
@@ -105,6 +131,8 @@ class UnifiedOrderBody(BaseModel):
     openid: Optional[str] = None
     user_id: Optional[int] = None
     total_fee: Optional[int] = Field(None, description="支付金额单位：分，用于调微信统一下单")
+    coupon_id: Optional[int] = Field(None, description="单张优惠券ID（兼容旧客户端）")
+    coupon_ids: Optional[List[int]] = Field(None, description="多张优惠券ID（叠加抵扣）")
 
 
 # ------------------ 1. 创建支付单 ------------------
@@ -171,7 +199,11 @@ async def generate_permanent_qrcode(
 async def create_order_for_user(
     merchant_id: int = Query(..., description="商家ID"),
     amount: int = Query(..., gt=0, description="订单金额（单位：分）"),
-    coupon_id: Optional[int] = Query(None, description="优惠券ID（可选）"),
+    coupon_id: Optional[int] = Query(None, description="优惠券ID（可选，兼容单券）"),
+    coupon_ids: Optional[str] = Query(
+        None,
+        description="多张优惠券ID，逗号分隔（例如：1,2,3）；与 coupon_id 可同时存在，后端会去重合并",
+    ),
     current_user: dict = Depends(get_current_user)
 ):
     """
@@ -179,11 +211,19 @@ async def create_order_for_user(
     此接口不生成二维码，用于永久码扫码后的支付流程。
     """
     try:
+        parsed_ids: Optional[List[int]] = None
+        if coupon_ids:
+            try:
+                parsed_ids = [int(x.strip()) for x in coupon_ids.split(",") if x.strip()]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="coupon_ids 格式错误，应为逗号分隔整数")
+
         order_no = await OfflineService.create_order_for_user(
             merchant_id=merchant_id,
             user_id=current_user["id"],
             amount=amount,
-            coupon_id=coupon_id
+            coupon_id=coupon_id,
+            coupon_ids=parsed_ids,
         )
         return {"code": 0, "message": "订单创建成功", "data": {"order_no": order_no}}
     except ValueError as e:
@@ -193,28 +233,106 @@ async def create_order_for_user(
         raise HTTPException(status_code=500, detail="服务器内部错误")
 # ==============================================================
 
-# ==================== 普通二维码跳转页（微信验证/外部扫描） ====================
-@router.get("/permanentPay", include_in_schema=False)
-async def offline_permanent_pay(
-    merchant_id: int = Query(..., description="商家ID")
+# ==================== 永久收款 H5 中转（普通二维码请指向此 URL） ====================
+# 须在 main.py 中于 app.mount("/offline", StaticFiles...) 之前注册 pay_bridge_router，
+# 否则 /offline 会被静态目录或占位路由抢先匹配。
+@pay_bridge_router.get("/offline", include_in_schema=False)
+@pay_bridge_router.get("/pay-bridge", include_in_schema=False)
+async def offline_h5_pay_landing(
+    request: Request,
+    pay_id: int = Query(..., alias="id", ge=1, le=2_147_483_647, description="商户用户 ID"),
 ):
     """
-    接收外部普通二维码请求，将用户引导至小程序的永久收款页。
-
-    二维码内容示例：
-        https://<your-domain>/offline/permanentPay?merchant_id=123
-
-    目前只是做一个简单的 302 重定向到微信提供的 universal link，
-    小程序内部会在页面 `pages/offline/permanentPay` 中根据 merchant_id
-    继续后续业务逻辑（创建订单、填写金额等）。
+    普通二维码统一为 https://<域名>/offline?id=<商户用户ID>。
+    /pay-bridge?id= 为兼容旧码，与 /offline 行为相同。
+    服务端调用微信 generate_urllink / generatescheme 拉起小程序页 pages/offline/permanentPay?id=...
     """
-    from fastapi.responses import RedirectResponse
+    from urllib.parse import quote
+
+    ip = _pay_bridge_client_ip(request)
+    if not pay_bridge_ip_limiter.allow(ip):
+        logger.warning("[offline-pay] 限流 ip=%s id=%s", ip, pay_id)
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>访问过快</title></head>"
+            "<body><p>访问过于频繁，请稍后再试。</p></body></html>",
+            status_code=429,
+        )
+
+    if not OfflineService.is_valid_offline_permanent_pay_target(pay_id):
+        logger.info("[offline-pay] 无效或未授权商户 ip=%s id=%s", ip, pay_id)
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>无效链接</title></head>"
+            "<body><p>收款链接无效或已失效。</p></body></html>",
+            status_code=404,
+        )
+
+    logger.info("[offline-pay] 有效请求 ip=%s id=%s", ip, pay_id)
+
+    path_enc = quote(f"pages/offline/permanentPay?id={pay_id}", safe="")
+    fallback = (
+        f"https://servicewechat.com/{settings.WECHAT_APP_ID}/0/page-frame.html?path={path_enc}"
+    )
+
+    if settings.wx_mock_mode_bool or not (settings.WECHAT_APP_ID and settings.WECHAT_APP_SECRET):
+        logger.debug("[offline-pay] Mock 或未配置密钥，使用 servicewechat 回退 id=%s", pay_id)
+        return RedirectResponse(fallback, status_code=302)
+
+    # 微信内置浏览器：用加密 URL Scheme 在页面内立即 replace，通常比 302 到 URL Link 少一层「确认打开」中间页
+    if _pay_bridge_is_wechat_browser(request):
+        try:
+            openlink = await get_or_create_permanent_pay_openlink(pay_id)
+            safe = json.dumps(openlink, ensure_ascii=False)
+            html = (
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>"
+                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>"
+                "<title>正在打开小程序</title>"
+                f"<script>location.replace({safe});</script>"
+                "</head><body><p>正在打开小程序…</p></body></html>"
+            )
+            return HTMLResponse(html)
+        except Exception as e:
+            logger.warning(
+                "[offline-pay] scheme 拉起失败，改试 url_link id=%s: %s",
+                pay_id,
+                e,
+                exc_info=True,
+            )
+
+    try:
+        link = await get_or_create_permanent_pay_urllink(pay_id)
+        return RedirectResponse(link, status_code=302)
+    except Exception as e:
+        logger.warning(
+            "[offline-pay] url_link 失败，回退 servicewechat id=%s: %s",
+            pay_id,
+            e,
+            exc_info=True,
+        )
+        return RedirectResponse(fallback, status_code=302)
+
+
+# ==================== 普通二维码跳转页（兼容旧链接 / 无 url_link 场景） ====================
+@offline_public_router.get("/permanentPay", include_in_schema=False)
+async def offline_permanent_pay(
+    merchant_id: Optional[int] = Query(None, description="商家用户 ID（旧链接）"),
+    pay_id: Optional[int] = Query(None, alias="id", description="商家用户 ID"),
+):
+    """
+    兼容旧版二维码：https://<your-domain>/api/offline/permanentPay?merchant_id=123
+    新普通二维码请使用 /offline?id=123（见 generate_permanent_qrcode 返回的 universal_link）。
+    """
+    from urllib.parse import quote
+
+    if pay_id is not None:
+        mid = pay_id
+        path = quote(f"pages/offline/permanentPay?id={mid}", safe="")
+    elif merchant_id is not None:
+        mid = merchant_id
+        path = quote(f"pages/offline/permanentPay?merchant_id={mid}", safe="")
+    else:
+        raise HTTPException(status_code=400, detail="缺少参数 id 或 merchant_id")
 
     appid = settings.WECHAT_APP_ID
-    # 参数需要 URL 编码，虽然目前只传 merchant_id 数字，但未来扩展可加更多字段
-    from urllib.parse import quote
-    path = quote(f"pages/offline/permanentPay?merchant_id={merchant_id}", safe="")
-    # 微信小程序 universal link，可省略中间的版本号“/0/”
     url = f"https://servicewechat.com/{appid}/0/page-frame.html?path={path}"
     return RedirectResponse(url)
 
@@ -276,7 +394,16 @@ async def get_order_detail(
 @router.post("/zhifu/tongyi", summary="统一下单（支持优惠券）")
 async def unified_order(
     order_no: str = Query(..., description="订单号"),
-    coupon_id: Optional[int] = Query(None, description="优惠券ID（可选）"),
+    coupon_id_query: Optional[str] = Query(
+        None,
+        alias="coupon_id",
+        description="优惠券ID（可选）。支持单张整数，或与前端一致的多张逗号分隔（如 328,327），等价于 coupon_ids",
+    ),
+    coupon_ids_query: Optional[str] = Query(
+        None,
+        alias="coupon_ids",
+        description="多张优惠券ID，逗号分隔（例如：1,2,3）；也可使用 JSON Body 传 coupon_ids 数组",
+    ),
     total_fee_query: Optional[int] = Query(None, alias="total_fee", description="支付金额单位：分（可选，与 body 二选一）"),
     current_user: dict = Depends(get_current_user),
     body: Optional[UnifiedOrderBody] = Body(None),
@@ -295,18 +422,49 @@ async def unified_order(
     elif total_fee_query is not None and total_fee_query > 0:
         total_fee = total_fee_query
 
+    merged_coupon_ids: Optional[List[int]] = None
+    if body and body.coupon_ids:
+        merged_coupon_ids = list(body.coupon_ids)
+    if coupon_ids_query:
+        try:
+            q_ids = [int(x.strip()) for x in coupon_ids_query.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="coupon_ids 格式错误，应为逗号分隔整数")
+        merged_coupon_ids = (merged_coupon_ids or []) + q_ids
+
+    # coupon_id 查询参数兼容：单整数 或 逗号分隔多张（避免前端误传导致 422）
+    merged_coupon_id: Optional[int] = None
+    if coupon_id_query is not None and str(coupon_id_query).strip():
+        raw = str(coupon_id_query).strip()
+        if "," in raw:
+            try:
+                from_coupon_id = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="coupon_id 格式错误，应为整数或逗号分隔整数")
+            merged_coupon_ids = (merged_coupon_ids or []) + from_coupon_id
+        else:
+            try:
+                merged_coupon_id = int(raw)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="coupon_id 格式错误，应为整数")
+
+    if body and body.coupon_id is not None:
+        # body 里的单券与 query 冲突时，优先使用 body（更贴近 POST JSON 语义）
+        merged_coupon_id = body.coupon_id
+
     # 记录日志，方便排查
     logger.info(f"[unified_order] 订单={order_no}, 用户={current_user['id']}, "
-                f"coupon_id={coupon_id}, total_fee={total_fee}, "
+                f"coupon_id={merged_coupon_id}, coupon_ids={merged_coupon_ids}, total_fee={total_fee}, "
                 f"mock_mode={settings.WX_MOCK_MODE}")
 
     try:
         result = await OfflineService.unified_order(
             order_no=order_no,
-            coupon_id=coupon_id,
+            coupon_id=merged_coupon_id,
             user_id=current_user["id"],
             openid=openid,
             total_fee=total_fee,
+            coupon_ids=merged_coupon_ids,
         )
 
         # 检查返回的支付参数
@@ -322,6 +480,11 @@ async def unified_order(
         else:
             result["is_mock"] = False
 
+        tw = result.get("merchant_transfer_warning")
+        resp_warning = result.get("warning")
+        if tw:
+            resp_warning = f"{resp_warning + '；' if resp_warning else ''}商家微信转账失败（已记账，请修证书/商户配置）: {tw}"
+
         return {
             "code": 0,
             "message": "统一下单成功",
@@ -334,7 +497,8 @@ async def unified_order(
                     "final_amount": result["final_amount"]
                 },
                 "is_mock": result.get("is_mock", False),
-                "warning": result.get("warning")
+                "warning": resp_warning,
+                "merchant_transfer_warning": tw,
             }
         }
     except ValueError as e:
@@ -420,14 +584,15 @@ async def qrcode_status(
 
 # ------------------ 9. 注册函数 ------------------
 def register_offline_routes(app) -> None:
-    app.include_router(
-        router,
-        prefix="/api/offline",
-        tags=["线下收银台付款模块"],   # 与 main.py 里 tags_metadata 的 name 保持一致
-        responses={
+    shared = {
+        "tags": ["线下收银台付款模块"],
+        "responses": {
             400: {"description": "业务错误"},
             401: {"description": "未认证"},
-            500: {"description": "服务器内部错误"}
-        }
-    )
+            500: {"description": "服务器内部错误"},
+        },
+    }
+    # pay_bridge_router（/offline、/pay-bridge）在 main.py 中于 mount /offline 静态目录之前注册
+    app.include_router(offline_public_router, prefix="/api/offline", tags=shared["tags"])
+    app.include_router(router, prefix="/api/offline", **shared)
     logger.info("✅ 离线支付路由注册完成 (路径: /api/offline/*)")

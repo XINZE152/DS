@@ -5,6 +5,7 @@ from typing import Final
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from urllib.parse import urlparse
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -34,9 +35,9 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 10
     qrcode_expire_seconds: int = 300
 
-    # 用于生成普通二维码的基础域名，末尾不应包含斜杠。
-    # 可以在 .env 中设置，如 HOST=https://hzai.tech
-    # 如果留空，返回的链接将以根路径开头（相对 URL）。
+    # 用于生成普通二维码、H5 跳转链接的公开访问根 URL，末尾不要斜杠。
+    # 可显式设置，如 HOST=https://yuzedigital.site
+    # 若留空且已配置 WECHAT_PAY_NOTIFY_URL，则自动取其 scheme+主机 作为公开域名。
     HOST: str = ""
 
     # 数据库
@@ -49,6 +50,11 @@ class Settings(BaseSettings):
     # 微信/支付相关
     WECHAT_APP_ID: str = ""
     WECHAT_APP_SECRET: str = ""
+    # 生成小程序码时指定要打开的小程序版本：release / trial / develop
+    # 开发工具调试未发正式版时，若扫码异常可设为 develop 或 trial
+    WECHAT_WXA_ENV_VERSION: str = "release"
+    # 小程序「开发 - 开发管理 - 消息推送」服务器配置中的 Token（明文模式校验 URL 用）
+    WECHAT_WXA_MSG_TOKEN: str = ""
 
     # ==================== 微信支付服务商配置（新增）====================
     WECHAT_PAY_SP_MCH_ID: str = ""  # 服务商商户号（平台作为服务商时使用）
@@ -85,6 +91,23 @@ class Settings(BaseSettings):
     @property
     def wx_use_pub_key_id_mode_bool(self) -> bool:
         return str(self.WX_USE_PUB_KEY_ID_MODE).lower() in ("true", "1", "yes", "on")
+
+    @property
+    def public_base_url(self) -> str:
+        """线下普通二维码、universal_link 等对外完整 URL 的站点根（无末尾 /）。"""
+        h = (self.HOST or "").strip().rstrip("/")
+        if h:
+            return h
+        notify = (self.WECHAT_PAY_NOTIFY_URL or "").strip()
+        if not notify:
+            return ""
+        try:
+            p = urlparse(notify)
+            if p.scheme in ("http", "https") and p.netloc:
+                return f"{p.scheme}://{p.netloc}".rstrip("/")
+        except Exception:
+            pass
+        return ""
 
     PUSH_TEMPLATE_ID_APPLYMENT: str = ""
     ENVIRONMENT: str = "development"
