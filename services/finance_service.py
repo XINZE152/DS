@@ -1800,6 +1800,120 @@ class FinanceService:
         except Exception as e:
             logger.error(f"❌ 退款失败: {e}")
             return False
+        
+    @staticmethod
+    def revoke_order_discounts(order_number: str, external_cur=None) -> None:
+        """
+        订单退款成功后，回退用户使用的积分和优惠券，并收回因该订单获得的积分。
+        注意：如果提供了 external_cur，则在该游标所在事务中执行，由调用方负责提交；
+            否则使用独立连接并自行提交。
+        """
+        from decimal import Decimal
+        from datetime import datetime
+        import json
+
+        logger = get_logger(__name__)
+
+        def _internal(cur):
+            # 1. 查询订单信息（锁定行）
+            cur.execute("""
+                SELECT id, user_id, pending_points, pending_coupon_ids, status
+                FROM orders
+                WHERE order_number = %s
+                FOR UPDATE
+            """, (order_number,))
+            order = cur.fetchone()
+            if not order:
+                logger.warning(f"退款回退折扣时订单不存在: {order_number}")
+                return
+            if order['status'] != 'refunded':
+                logger.info(f"订单 {order_number} 状态不是 refunded，跳过回退")
+                return
+
+            user_id = order['user_id']
+            order_id = order['id']
+            pending_points = Decimal(str(order.get('pending_points') or 0))
+            pending_coupon_ids_json = order.get('pending_coupon_ids')
+
+            # 2. 退回使用的积分（加回用户积分余额）
+            if pending_points > 0:
+                cur.execute("""
+                    UPDATE users
+                    SET member_points = member_points + %s
+                    WHERE id = %s
+                """, (pending_points, user_id))
+                cur.execute("SELECT member_points FROM users WHERE id = %s", (user_id,))
+                new_balance = cur.fetchone()['member_points']
+                cur.execute("""
+                    INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+                    VALUES (%s, %s, %s, 'member', %s, %s, NOW())
+                """, (user_id, pending_points, new_balance, f"订单退款退回积分: {order_number}", order_id))
+                logger.info(f"订单 {order_number} 退回积分 {pending_points} 给用户 {user_id}")
+
+            # 3. 退回使用的优惠券
+            coupon_ids = []
+            if pending_coupon_ids_json:
+                try:
+                    coupon_ids = json.loads(pending_coupon_ids_json)
+                except Exception:
+                    logger.warning(f"解析 pending_coupon_ids 失败: {pending_coupon_ids_json}")
+            if coupon_ids:
+                placeholders = ','.join(['%s'] * len(coupon_ids))
+                cur.execute(f"""
+                    SELECT id, valid_to FROM coupons
+                    WHERE id IN ({placeholders})
+                """, tuple(coupon_ids))
+                rows = cur.fetchall()
+                valid_ids = [row['id'] for row in rows if row['valid_to'] >= datetime.now().date()]
+                if valid_ids:
+                    cur.execute(f"""
+                        UPDATE coupons
+                        SET status = 'unused', used_at = NULL
+                        WHERE id IN ({','.join(['%s'] * len(valid_ids))})
+                    """, tuple(valid_ids))
+                    logger.info(f"订单 {order_number} 退回优惠券: {valid_ids}")
+                else:
+                    logger.info(f"订单 {order_number} 使用的优惠券均已过期，无法退回")
+
+            # 4. 收回因该订单获得的积分（仅收回结算时自动发放的积分）
+            cur.execute("""
+                SELECT SUM(change_amount) as total_granted
+                FROM points_log
+                WHERE related_order = %s 
+                AND type = 'member' 
+                AND change_amount > 0
+                AND reason IN ('购买会员商品获得积分', '购买普通商品获得积分', '购买商品赠送积分')
+            """, (order_id,))
+            row = cur.fetchone()
+            total_granted = Decimal(str(row['total_granted'] or 0))
+            if total_granted > 0:
+                # 查询当前余额
+                cur.execute("SELECT member_points FROM users WHERE id = %s", (user_id,))
+                current_points = Decimal(str(cur.fetchone()['member_points'] or 0))
+                actual_deduct = min(total_granted, current_points)
+                if actual_deduct > 0:
+                    cur.execute("""
+                        UPDATE users
+                        SET member_points = member_points - %s
+                        WHERE id = %s
+                    """, (actual_deduct, user_id))
+                    new_balance = current_points - actual_deduct
+                    cur.execute("""
+                        INSERT INTO points_log (user_id, change_amount, balance_after, type, reason, related_order, created_at)
+                        VALUES (%s, %s, %s, 'member', %s, %s, NOW())
+                    """, (user_id, -actual_deduct, new_balance, f"订单退款收回奖励积分: {order_number}", order_id))
+                    logger.info(f"订单 {order_number} 收回奖励积分 {actual_deduct} 从用户 {user_id}（应收回 {total_granted}，余额不足仅扣 {actual_deduct}）")
+                else:
+                    logger.warning(f"订单 {order_number} 用户 {user_id} 积分余额不足，无法收回奖励积分 {total_granted}")
+
+        if external_cur is not None:
+            cur = external_cur
+            _internal(cur)
+        else:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    _internal(cur)
+                    conn.commit()
 
     def apply_withdrawal(self, user_id: int, amount: float, withdrawal_type: str = 'user') -> Optional[int]:
         """申请提现"""
@@ -8156,12 +8270,9 @@ def _execute_split(cur, order_number: str, total: Decimal):
 
 
 def reverse_split_on_refund(order_number: str):
-    """退款回冲：撤销订单分账
-
-    参数:
-        order_number: 订单号
-    """
+    """退款回冲：撤销订单分账"""
     from core.database import get_conn
+    from decimal import Decimal
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -8179,19 +8290,9 @@ def reverse_split_on_refund(order_number: str):
                     "UPDATE users SET merchant_balance=merchant_balance-%s WHERE id=1",
                     (m,)
                 )
-
                 # 获取回冲后的余额
-                select_sql = build_dynamic_select(
-                    cur,
-                    "users",
-                    where_clause="id=1",
-                    select_fields=["merchant_balance"]
-                )
-                cur.execute(select_sql)
-                merchant_balance_row = cur.fetchone()
-                merchant_balance_after = merchant_balance_row["merchant_balance"] if merchant_balance_row else Decimal(
-                    "0")
-
+                cur.execute("SELECT merchant_balance FROM users WHERE id=1")
+                merchant_balance_after = cur.fetchone()["merchant_balance"]
                 # 记录回冲流水
                 cur.execute(
                     """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
@@ -8212,39 +8313,24 @@ def reverse_split_on_refund(order_number: str):
             }
 
             for pool_key, account_type in pool_mapping.items():
-                # 查询该池子的分账金额
                 cur.execute(
                     """SELECT SUM(change_amount) AS amt FROM account_flow 
                        WHERE account_type=%s AND remark LIKE %s AND flow_type='income'""",
                     (account_type, f"订单分账: {order_number}%")
                 )
                 pool_amt = cur.fetchone()["amt"] or Decimal("0")
-
                 if pool_amt > 0:
-                    # 回冲资金池余额
                     cur.execute(
                         "UPDATE finance_accounts SET balance = balance - %s WHERE account_type = %s",
                         (pool_amt, account_type)
                     )
-
-                    # 获取回冲后的余额
-                    select_sql = build_dynamic_select(
-                        cur,
-                        "finance_accounts",
-                        where_clause="account_type = %s",
-                        select_fields=["balance"]
-                    )
-                    cur.execute(select_sql, (account_type,))
-                    balance_row = cur.fetchone()
-                    balance_after = balance_row["balance"] if balance_row else Decimal("0")
-
-                    # 记录回冲流水
+                    cur.execute("SELECT balance FROM finance_accounts WHERE account_type = %s", (account_type,))
+                    balance_after = cur.fetchone()["balance"]
                     cur.execute(
                         """INSERT INTO account_flow (account_type, change_amount, balance_after, flow_type, remark, created_at)
                            VALUES (%s, %s, %s, %s, %s, NOW())""",
                         (account_type, -pool_amt, balance_after, "expense", f"退款回冲: {order_number}")
                     )
-
             conn.commit()
 
 

@@ -489,6 +489,8 @@ async def wechat_refund_notify(request: Request):
     try:
         body = await request.body()
         headers = request.headers
+        
+        logger.info(f"【退款回调】收到通知，headers: {dict(headers)}")
 
         # 1. 验签（可选但推荐）
         signature = headers.get("Wechatpay-Signature")
@@ -496,62 +498,118 @@ async def wechat_refund_notify(request: Request):
         nonce = headers.get("Wechatpay-Nonce")
         serial = headers.get("Wechatpay-Serial")
         if not all([signature, timestamp, nonce, serial]):
-            logger.warning("退款回调缺少必要的签名头")
-            return Response(content="", status_code=200)  # 避免微信重试
+            logger.warning("【退款回调】缺少必要的签名头")
+            return Response(content="", status_code=200)
 
         if not pay_client.verify_signature(signature, timestamp, nonce, body.decode()):
-            logger.warning("退款回调签名验证失败")
+            logger.warning("【退款回调】签名验证失败")
             return Response(content="", status_code=200)
 
         # 2. 解析 JSON
-        data = json.loads(body)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            logger.error(f"【退款回调】JSON 解析失败: {e}")
+            return Response(content="", status_code=200)
+            
         resource = data.get("resource", {})
         if not resource:
-            logger.warning("退款回调缺少 resource 字段")
+            logger.warning("【退款回调】缺少 resource 字段")
             return Response(content="", status_code=200)
 
         # 3. 解密 resource
-        decrypted = pay_client.decrypt_callback_data(resource)   # 复用已有方法
+        decrypted = pay_client.decrypt_callback_data(resource)
         if not decrypted:
-            logger.warning("退款回调解密失败")
+            logger.warning("【退款回调】解密失败")
             return Response(content="", status_code=200)
 
         # 4. 提取关键信息
         out_refund_no = decrypted.get('out_refund_no')
-        refund_status = decrypted.get('refund_status')   # SUCCESS / CHANGE / REFUNDCLOSE
+        refund_status = decrypted.get('refund_status')   # SUCCESS / CHANGE / REFUNDCLOSE / PROCESSING
         transaction_id = decrypted.get('transaction_id')
+        refund_id = decrypted.get('refund_id')
+        amount = decrypted.get('amount', {})
 
-        logger.info(f"退款回调: out_refund_no={out_refund_no}, status={refund_status}")
+        logger.info(f"【退款回调】解密数据: out_refund_no={out_refund_no}, status={refund_status}, refund_id={refund_id}, amount={amount}")
 
+        # 🔥 新增：处理不同状态
         if refund_status == 'SUCCESS':
-            # ---------- 精确匹配订单号 ----------
-            # 方式一：从 out_refund_no 提取（需保证格式 REF{order_number}_timestamp）
-            # 提取 order_number = out_refund_no.split('_')[0][3:]
-            # 方式二：如果 orders 表有 refund_no 字段，可直接用该字段查询
+            order_number_to_revoke = None
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # 假设 orders 表已添加 refund_no 字段
+                    # 先通过 refund_no 更新
                     cur.execute(
-                        "UPDATE orders SET status='refunded', updated_at=NOW() WHERE refund_no=%s",
+                        "UPDATE orders SET status='refunded', updated_at=NOW() WHERE refund_no=%s AND status='refunding'",
                         (out_refund_no,)
                     )
-                    if cur.rowcount == 0:
-                        # 回退方式：通过模糊匹配
-                        order_number = out_refund_no.split('_')[0][3:]
-                        cur.execute(
-                            "UPDATE orders SET status='refunded', updated_at=NOW() WHERE order_number=%s",
-                            (order_number,)
-                        )
+                    updated_rows = cur.rowcount
+                    
+                    if updated_rows == 0:
+                        # 尝试通过解析 out_refund_no 获取 order_number
+                        try:
+                            parts = out_refund_no.split('_')
+                            if len(parts) >= 2 and parts[0].startswith('REF'):
+                                order_number = parts[0][3:]
+                                cur.execute(
+                                    "UPDATE orders SET status='refunded', updated_at=NOW() WHERE order_number=%s AND status='refunding'",
+                                    (order_number,)
+                                )
+                                updated_rows = cur.rowcount
+                                logger.info(f"【退款回调】通过解析 order_number 更新: {order_number}, 影响行数: {updated_rows}")
+                                if updated_rows > 0:
+                                    order_number_to_revoke = order_number
+                        except Exception as e:
+                            logger.error(f"【退款回调】解析 order_number 失败: {e}")
+                    else:
+                        # 获取被更新的订单号，用于后续回退
+                        cur.execute("SELECT order_number FROM orders WHERE refund_no=%s", (out_refund_no,))
+                        row = cur.fetchone()
+                        if row:
+                            order_number_to_revoke = row['order_number']
+                    
+                    if updated_rows > 0 and order_number_to_revoke:
+                        # ✅ 在同一个事务中调用回退方法（复用当前游标）
+                        try:
+                            from services.finance_service import FinanceService
+                            FinanceService.revoke_order_discounts(order_number_to_revoke, external_cur=cur)
+                            logger.info(f"【退款回调】积分/优惠券回退成功: {order_number_to_revoke}")
+                        except Exception as e:
+                            logger.error(f"【退款回调】回退积分/优惠券失败，事务将回滚: {e}", exc_info=True)
+                            # 抛出异常，导致外层事务回滚，订单状态保持 refunding
+                            raise
+                    
+                    if updated_rows > 0:
+                        conn.commit()
+                        logger.info(f"【退款回调】✅ 退款成功并完成积分/优惠券回退: out_refund_no={out_refund_no}")
+                    else:
+                        logger.warning(f"【退款回调】⚠️ 未找到匹配的退款中订单: out_refund_no={out_refund_no}")
+                        
+        elif refund_status == 'PROCESSING':
+            logger.info(f"【退款回调】退款处理中: out_refund_no={out_refund_no}")
+            # 保持 refunding 状态，等待下一次回调
+            
+        elif refund_status == 'CHANGE':
+            logger.warning(f"【退款回调】退款异常，需要人工处理: out_refund_no={out_refund_no}, detail={decrypted}")
+            # 可以发送告警通知管理员
+            
+        elif refund_status == 'REFUNDCLOSE':
+            logger.warning(f"【退款回调】退款关闭: out_refund_no={out_refund_no}")
+            # 更新订单状态回退到之前状态（如 completed）
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE orders SET status='completed', updated_at=NOW() WHERE refund_no=%s AND status='refunding'",
+                        (out_refund_no,)
+                    )
                     conn.commit()
-            logger.info(f"退款成功: out_refund_no={out_refund_no}")
         else:
-            logger.warning(f"退款状态异常: {refund_status} - {decrypted}")
+            logger.warning(f"【退款回调】未知状态: {refund_status} - {decrypted}")
 
-        # 微信期望任意 2xx 响应即可，无需特定格式
+        # 微信期望任意 2xx 响应
         return Response(content="", status_code=200)
 
     except Exception as e:
-        logger.error(f"退款回调处理失败: {e}", exc_info=True)
+        logger.error(f"【退款回调】处理失败: {e}", exc_info=True)
         # 返回 200 避免微信重试（但记录日志人工处理）
         return Response(content="", status_code=200)
 
@@ -875,6 +933,94 @@ async def _handle_online_pay_success(order_no: str, transaction_id: str, amount:
     except Exception as e:
         logger.error(f"线上订单支付成功处理失败: {e}", exc_info=True)
         # 异常已由上层捕获，订单状态保持 pending_pay，不会错误更新
+
+@router.post("/refund", summary="申请订单退款")
+async def create_refund(request: Request):
+    """
+    主动申请微信退款（支持线上订单）
+    请求体: {
+        "order_number": "订单号",
+        "refund_fee": 100,  # 退款金额（分），可选，默认全额
+        "reason": "退款原因"  # 可选
+    }
+    """
+    try:
+        payload = await request.json()
+        order_number = payload.get("order_number")
+        refund_fee = payload.get("refund_fee")  # 分
+        reason = payload.get("reason", "用户申请退款")
+        
+        if not order_number:
+            raise HTTPException(400, "缺少订单号")
+        
+        from core.database import get_conn
+        import pymysql
+        from decimal import Decimal
+        
+        with get_conn() as conn:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 查询订单
+                cur.execute(
+                    """SELECT id, order_number, transaction_id, total_amount, status, user_id 
+                    FROM orders WHERE order_number=%s""",
+                    (order_number,)
+                )
+                order = cur.fetchone()
+                
+                if not order:
+                    raise HTTPException(404, "订单不存在")
+                
+                if order["status"] not in ["pending_ship", "pending_recv", "completed"]:
+                    raise HTTPException(400, f"订单状态 {order['status']} 不允许退款")
+                
+                transaction_id = order.get("transaction_id")
+                if not transaction_id:
+                    raise HTTPException(400, "订单未支付或缺少微信交易号")
+                
+                # 计算退款金额（分）
+                total_fee = int((Decimal(str(order["total_amount"])) * 100).quantize(Decimal("1")))
+                if refund_fee:
+                    refund_fee = int(refund_fee)
+                    if refund_fee > total_fee:
+                        raise HTTPException(400, "退款金额不能大于订单金额")
+                else:
+                    refund_fee = total_fee
+                
+                # 生成退款单号
+                import time
+                out_refund_no = f"REF{order_number}_{int(time.time())}"
+                
+                # 调用微信退款
+                logger.info(f"[Refund] 发起退款: order={order_number}, tx={transaction_id}, refund_fee={refund_fee}")
+                result = pay_client.refund(
+                    transaction_id=transaction_id,
+                    out_refund_no=out_refund_no,
+                    total_fee=total_fee,
+                    refund_fee=refund_fee,
+                    notify_url=f"{settings.WECHAT_PAY_NOTIFY_URL}/refund-notify" if settings.WECHAT_PAY_NOTIFY_URL else None
+                )
+                
+                logger.info(f"[Refund] 微信退款申请结果: {result}")
+                
+                # 更新订单状态为退款中
+                cur.execute(
+                    "UPDATE orders SET status='refunding', refund_no=%s, updated_at=NOW() WHERE id=%s",
+                    (out_refund_no, order["id"])
+                )
+                conn.commit()
+                
+                return {
+                    "success": True,
+                    "refund_no": out_refund_no,
+                    "wechat_result": result,
+                    "message": "退款申请已提交，等待微信处理"
+                }
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Refund] 退款申请失败: {e}", exc_info=True)
+        raise HTTPException(500, f"退款申请失败: {str(e)}")
 
 # 注册路由函数（原文件末尾已有，保留不变）
 def register_wechat_pay_routes(app):

@@ -39,6 +39,7 @@ from api.store_setup.routes import register_store_routes
 # 新增导入：
 from api.bankcard.routes import register_bankcard_routes
 from api.offline.routes import register_offline_routes, pay_bridge_router
+from api.order.refund import router as refund_router   # ✅ 新增导入
 
 def ensure_database():
     """确保数据库存在"""
@@ -214,6 +215,10 @@ register_wechat_wxa_routes(app)
 register_store_routes(app)
 register_bankcard_routes(app) # 修改：注册新的银行卡路由
 register_offline_routes(app)
+
+# ✅ 注册退款路由（根路径 + /api 前缀，兼容不同前端请求）
+app.include_router(refund_router)                     # 路径: /refund/*
+app.include_router(refund_router, prefix="/api")      # 路径: /api/refund/*
 
 # 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
 # 注意：必须在路由注册之后设置，否则 schema 中不会包含路由
