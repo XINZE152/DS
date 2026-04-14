@@ -476,27 +476,73 @@ class OfflineService:
     @staticmethod
     async def refund(order_no: str, refund_amount: Optional[int], user_id: int):
         current_user_id = str(user_id)
+        out_refund_no = None  # 🔧 提前定义，避免作用域问题
+        
         with get_conn() as conn:
             with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                # 🔧 修改1：增加查询 transaction_id 和 paid_amount
                 cur.execute(
-                    "SELECT id,amount,status FROM offline_order WHERE order_no=%s AND merchant_id=%s",
+                    "SELECT id, amount, paid_amount, status, transaction_id FROM offline_order WHERE order_no=%s AND merchant_id=%s",
                     (order_no, current_user_id)
                 )
                 row = cur.fetchone()
                 if not row or row["status"] != 2:
-                    raise ValueError("订单未支付")
-                amount = row["amount"]
-                money = refund_amount or amount
+                    raise ValueError("订单未支付或状态异常")
+                
+                # 🔧 修改2：使用实际支付金额（paid_amount）而非订单金额
+                total_fee = int(row["paid_amount"]) if row["paid_amount"] else int(row["amount"])
+                refund_fee = refund_amount or total_fee
+                transaction_id = row.get("transaction_id")
+                
+                if not transaction_id:
+                    raise ValueError("订单缺少微信交易号，无法退款")
+                
+                # 🔧 修改3：生成唯一退款单号
+                import time
+                out_refund_no = f"REF{order_no}_{int(time.time())}"
+                
+                # 🔧 修改4：调用微信退款接口（关键修改）
+                try:
+                    from core.wx_pay_client import wxpay_client
+                    logger.info(f"[Offline] 调用微信退款: order_no={order_no}, transaction_id={transaction_id}, refund_fee={refund_fee}")
+                    
+                    wx_result = wxpay_client.refund(
+                        transaction_id=transaction_id,
+                        out_refund_no=out_refund_no,
+                        total_fee=total_fee,
+                        refund_fee=refund_fee,
+                        notify_url=f"{settings.WECHAT_PAY_NOTIFY_URL}/refund-notify" if settings.WECHAT_PAY_NOTIFY_URL else None
+                    )
+                    
+                    logger.info(f"[Offline] 微信退款申请成功: {wx_result}")
+                    
+                    # 🔧 修改5：更新订单状态为退款处理中（status=4），并记录退款单号
+                    cur.execute(
+                        """UPDATE offline_order 
+                        SET status=4, 
+                            refund_id=%s,
+                            refund_time=NOW(),
+                            updated_at=NOW() 
+                        WHERE order_no=%s AND merchant_id=%s""",
+                        (out_refund_no, order_no, current_user_id)
+                    )
+                    conn.commit()
+                    
+                except Exception as wx_err:
+                    logger.error(f"[Offline] 微信退款申请失败: {wx_err}", exc_info=True)
+                    conn.rollback()
+                    raise ValueError(f"微信退款申请失败: {str(wx_err)}")
+                
+                # 🔧 修改6：内部账务处理（放在微信调用之后）
+                try:
+                    await FinanceService.refund_order(order_no)
+                except Exception as finance_err:
+                    logger.error(f"[Offline] 内部账务退款失败（需人工处理）: {finance_err}", exc_info=True)
+                    # 不抛出异常，因为微信退款已成功，仅记录日志
 
-                cur.execute(
-                    "UPDATE offline_order SET status=4 WHERE order_no=%s AND merchant_id=%s",
-                    (order_no, current_user_id)
-                )
-                conn.commit()
-
-        await FinanceService.refund_order(order_no)
-        logger.info(f"[Offline] 退款 {order_no} 金额 {money} 商户={current_user_id}")
-        return {"refund_no": f"REF{order_no}"}
+        # ✅ 修正缩进：这两行必须在方法内部，与 with 块同级
+        logger.info(f"[Offline] 退款申请提交成功: {order_no}, 退款单号={out_refund_no}, 金额={refund_fee}")
+        return {"refund_no": out_refund_no, "status": "processing", "message": "退款申请已提交，等待微信处理"}
 
     # ---------- 7. 收款码状态 ----------
     @staticmethod

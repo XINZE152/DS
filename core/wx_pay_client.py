@@ -893,17 +893,13 @@ class WeChatPayClient:
             key = self.apiv3_key
             if not key:
                 raise Exception("API v3 key 未配置")
-            # 生产要求：key 必须为 16/24/32 字节，长度不符应视为配置错误
             if len(key) not in (16, 24, 32):
                 raise Exception("API v3 key 长度无效，必须为 16/24/32 字节")
 
             aesgcm = AESGCM(key)
 
-            # nonce 可能是 base64 编码的原始字节，也可能是明文字符串，先尝试 base64 解码
-            try:
-                nonce_bytes = base64.b64decode(nonce)
-            except Exception:
-                nonce_bytes = nonce.encode('utf-8')
+            # ✅ 修复：nonce 是明文字符串，直接编码
+            nonce_bytes = nonce.encode('utf-8')
 
             associated_bytes = associated_data.encode('utf-8') if associated_data else None
 
@@ -914,19 +910,16 @@ class WeChatPayClient:
             )
             return json.loads(decrypted.decode('utf-8'))
         except Exception as e:
-            try:
-                logger.error(
-                    "解密失败: %s; ct_len=%s; nonce_len=%s; ad_len=%s; ct_preview=%s",
-                    str(e),
-                    len(cipher_text) if isinstance(cipher_text, str) else None,
-                    len(nonce) if isinstance(nonce, str) else None,
-                    len(associated_data) if isinstance(associated_data, str) else None,
-                    cipher_text[:30] + "..." + cipher_text[-30:] if isinstance(cipher_text, str) and len(cipher_text) > 80 else cipher_text,
-                )
-            except Exception:
-                logger.error(f"解密失败且记录日志时异常: {str(e)}")
-            # 解密失败时不尝试将 ciphertext 当作 JSON 解析返回（会导致二次解析错误）
-            # 返回空字典，调用方应对缺失字段做校验并返回合适的错误响应
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(
+                "解密失败: %s\n堆栈跟踪:\n%s\nct_len=%s, nonce_len=%s, ad_len=%s, ct_preview=%s",
+                str(e), tb,
+                len(cipher_text) if isinstance(cipher_text, str) else None,
+                len(nonce) if isinstance(nonce, str) else None,
+                len(associated_data) if isinstance(associated_data, str) else None,
+                cipher_text[:30] + "..." + cipher_text[-30:] if isinstance(cipher_text, str) and len(cipher_text) > 80 else cipher_text,
+            )
             return {}
 
     # ==================== 结算账户相关API ====================
@@ -1055,9 +1048,9 @@ class WeChatPayClient:
             'applyment_state_msg': data.get('applyment_state_msg', '')
         }
 
-    # ==================== 退款方法（调用微信支付V3退款接口） ====================
+        # ==================== 退款方法（调用微信支付V3退款接口） ====================
     def refund(self, transaction_id: str, out_refund_no: str, total_fee: int, refund_fee: int,
-               notify_url: Optional[str] = None) -> Dict[str, Any]:
+               notify_url: Optional[str] = None, sub_mchid: Optional[str] = None) -> Dict[str, Any]:
         """
         申请退款（支持部分退款）
         :param transaction_id: 微信支付订单号
@@ -1065,6 +1058,7 @@ class WeChatPayClient:
         :param total_fee: 原订单总金额（分）
         :param refund_fee: 退款金额（分）
         :param notify_url: 退款结果回调地址（可选）
+        :param sub_mchid: 子商户号（服务商模式必填）
         :return: 微信退款接口返回的 JSON 数据
         """
         url_path = '/v3/refund/domestic/refunds'
@@ -1078,19 +1072,51 @@ class WeChatPayClient:
                 "currency": "CNY"
             }
         }
+        
+        # 🔥 关键修复：服务商模式需要传入 sub_mchid
+        if sub_mchid:
+            body["sub_mchid"] = sub_mchid
+            logger.info(f"【微信退款】使用子商户号: {sub_mchid}")
+        
         if notify_url:
             body["notify_url"] = notify_url
 
         body_str = json.dumps(body, ensure_ascii=False)
+        
+        # 🔍 添加详细请求日志
+        logger.info(f"【微信退款】请求URL: {full_url}")
+        logger.info(f"【微信退款】请求体: {body_str}")
+        logger.info(f"【微信退款】transaction_id: {transaction_id}, total_fee: {total_fee}, refund_fee: {refund_fee}")
+        
         headers = {
             'Authorization': self._build_auth_header('POST', url_path, body_str),
             'Content-Type': 'application/json',
             'Accept': 'application/json',
             'Wechatpay-Serial': self._get_merchant_serial_no()
         }
-        response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=15)
-        response.raise_for_status()
-        return response.json()
+        
+        try:
+            response = self.session.post(full_url, data=body_str.encode('utf-8'), headers=headers, timeout=15)
+            
+            # 🔍 记录响应详情
+            logger.info(f"【微信退款】响应状态码: {response.status_code}")
+            logger.info(f"【微信退款】响应内容: {response.text[:500]}")  # 限制长度避免日志过大
+            
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            # 🔍 详细记录 HTTP 错误
+            logger.error(f"【微信退款】HTTP错误: {e}")
+            logger.error(f"【微信退款】错误响应状态: {e.response.status_code}")
+            logger.error(f"【微信退款】错误响应内容: {e.response.text}")
+            
+            try:
+                error_data = e.response.json()
+                logger.error(f"【微信退款】微信错误详情: {error_data}")
+            except:
+                logger.error(f"【微信退款】无法解析错误响应为JSON")
+            
+            raise
 
 
     # ==================== 本地加密解密工具 ====================
