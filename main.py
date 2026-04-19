@@ -216,9 +216,10 @@ register_store_routes(app)
 register_bankcard_routes(app) # 修改：注册新的银行卡路由
 register_offline_routes(app)
 
-# ✅ 注册退款路由（根路径 + /api 前缀，兼容不同前端请求）
-app.include_router(refund_router)                     # 路径: /refund/*
-app.include_router(refund_router, prefix="/api")      # 路径: /api/refund/*
+# ✅ 注册退款路由（根路径 + /api 前缀，兼容不同前端请求；标准路径另有 /refund/*）
+# 必须传 tags，否则 operation 无 tags，Swagger UI 会归到「default」分组
+app.include_router(refund_router, tags=["订单系统"])
+app.include_router(refund_router, prefix="/api", tags=["订单系统"])
 
 # 自定义 OpenAPI Schema 生成函数，确保只显示定义的4个标签
 # 注意：必须在路由注册之后设置，否则 schema 中不会包含路由

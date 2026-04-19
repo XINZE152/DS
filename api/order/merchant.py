@@ -275,6 +275,12 @@ class MShip(BaseModel):
     express_company: Optional[str] = None
     logistics_type: Optional[int] = None
     item_desc: Optional[str] = None
+    # 扫码枪/电子面单复制的一整段；与 tracking_number / express_company 合并，显式传入的字段优先
+    scan_text: Optional[str] = None
+
+
+class MShipScanParse(BaseModel):
+    raw: str
 
 
 class MRefundAudit(BaseModel):
@@ -333,12 +339,28 @@ def m_wx_shipping_msg_jump_path(body: MWxShippingMsgJumpPath):
     return result
 
 
+@router.post("/ship/parse-scan", summary="解析扫码/面单文本为运单号与快递公司（仅解析，不写入）")
+def m_ship_parse_scan(body: MShipScanParse):
+    from services.logistics_scan_parse import parse_ship_scan
+
+    return {"ok": True, "data": parse_ship_scan(body.raw)}
+
+
 @router.post("/ship", summary="订单发货")
 def m_ship(body: MShip):
+    tracking_number = body.tracking_number
+    express_company = body.express_company
+    if body.scan_text:
+        from services.logistics_scan_parse import parse_ship_scan
+
+        parsed = parse_ship_scan(body.scan_text)
+        tracking_number = tracking_number or parsed.get("tracking_number")
+        express_company = express_company or parsed.get("express_company")
+
     result = MerchantManager.ship(
         order_number=body.order_number,
-        tracking_number=body.tracking_number,
-        express_company=body.express_company,
+        tracking_number=tracking_number,
+        express_company=express_company,
         logistics_type=body.logistics_type,
         item_desc=body.item_desc
     )
